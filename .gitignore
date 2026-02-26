@@ -1,4 +1,4 @@
-﻿################################################################################
+################################################################################
 # This .gitignore file was automatically created by Microsoft(R) Visual Studio.
 ################################################################################
 
@@ -20,3 +20,7 @@
 /MongoMigrationWebApp/appsettings.Development.json
 /MongoMigrationWebApp/Properties/PublishProfiles
 /SchemaMigration/__pycache__
+
+# Private configuration files with credentials
+.env.local
+ACA/private.*.ps1

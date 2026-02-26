@@ -22,7 +22,31 @@ param(
     [string]$JFrogBaseImageRegistry = "",
     
     [Parameter(Mandatory=$false)]
+    [string]$JFrogBaseImageRepository = "",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogDebianRepo = "",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogDebianDistribution = "bookworm",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogDebianComponent = "main",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogNuGetRepo = "",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogPassword = "",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ImageName = "mongo-migration",
+    
+    [Parameter(Mandatory=$false)]
     [string]$ImageTag = "latest",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogRegistryServerForACA = "",
     
     [Parameter(Mandatory=$false)]
     [switch]$SkipDockerBuild
@@ -35,9 +59,21 @@ if ([string]::IsNullOrEmpty($JFrogBaseImageRegistry)) {
     $JFrogBaseImageRegistry = $JFrogRegistryServer
 }
 
-# Build full image path
-$FullImagePath = "$JFrogRegistryServer/$JFrogRepository"
+# Use group repository for base images if not specified
+if ([string]::IsNullOrEmpty($JFrogBaseImageRepository)) {
+    $JFrogBaseImageRepository = $JFrogRepository -replace '-stage$', '-group' -replace '-local$', '-group'
+}
+
+# Use separate registry server for ACA if specified (e.g., with port 22609 for NVA Binary Port Mapping)
+if ([string]::IsNullOrEmpty($JFrogRegistryServerForACA)) {
+    $JFrogRegistryServerForACA = $JFrogRegistryServer
+}
+
+# Build full image paths - one for local Docker operations, one for ACA
+$FullImagePath = "$JFrogRegistryServer/$JFrogRepository/$ImageName"
 $FullImageWithTag = "${FullImagePath}:${ImageTag}"
+$FullImagePathForACA = "$JFrogRegistryServerForACA/$JFrogRepository/$ImageName"
+$FullImageWithTagForACA = "${FullImagePathForACA}:${ImageTag}"
 
 Write-Host "`n=== Azure Container App - Image Update (JFrog Registry) ===" -ForegroundColor Cyan
 Write-Host "Resource Group: $ResourceGroupName" -ForegroundColor White
@@ -48,12 +84,17 @@ Write-Host "Image Tag: $ImageTag" -ForegroundColor White
 Write-Host "Full Image: $FullImageWithTag" -ForegroundColor White
 Write-Host ""
 
-# Prompt for JFrog password/API key
+# Prompt for JFrog password/API key (if not provided as parameter)
 Write-Host "JFrog Authentication" -ForegroundColor Yellow
-$secureJFrogPassword = Read-Host -Prompt "Enter JFrog password or API key" -AsSecureString
-$jfrogPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureJFrogPassword)
-)
+if ([string]::IsNullOrEmpty($JFrogPassword)) {
+    $secureJFrogPassword = Read-Host -Prompt "Enter JFrog password or API key" -AsSecureString
+    $jfrogPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureJFrogPassword)
+    )
+} else {
+    $jfrogPassword = $JFrogPassword
+    Write-Host "Using JFrog password from parameter" -ForegroundColor Gray
+}
 
 if (-not $SkipDockerBuild) {
     Write-Host "`nStep 1: Building and pushing new image to JFrog..." -ForegroundColor Yellow
@@ -93,6 +134,14 @@ if (-not $SkipDockerBuild) {
         docker build `
             -f MongoMigrationWebApp/Dockerfile.jfrog `
             --build-arg JFROG_REGISTRY=$JFrogBaseImageRegistry `
+            --build-arg JFROG_REPOSITORY=$JFrogBaseImageRepository `
+            --build-arg JFROG_DEBIAN_REPO=$JFrogDebianRepo `
+            --build-arg JFROG_DEBIAN_URL="https://$JFrogRegistryServer/artifactory/$JFrogDebianRepo" `
+            --build-arg JFROG_DEBIAN_DISTRIBUTION=$JFrogDebianDistribution `
+            --build-arg JFROG_DEBIAN_COMPONENT=$JFrogDebianComponent `
+            --build-arg JFROG_NUGET_URL="https://$JFrogRegistryServer/artifactory/api/nuget/v3/$JFrogNuGetRepo/index.json" `
+            --build-arg JFROG_USERNAME=$JFrogUsername `
+            --build-arg JFROG_PASSWORD=$jfrogPassword `
             -t $FullImageWithTag `
             .
         
@@ -144,14 +193,14 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "Warning: Could not update JFrog secret. Continuing with existing secret..." -ForegroundColor Yellow
 }
 
-# Update the container app with new image
+# Update the container app with new image (use ACA-specific image path for port mapping)
 az containerapp update `
     --name $ContainerAppName `
     --resource-group $ResourceGroupName `
     --min-replicas 1 `
     --max-replicas 1 `
     --set template.scale.rules=[] `
-    --image $FullImageWithTag `
+    --image $FullImageWithTagForACA `
     2>&1 | Where-Object { $_ -notmatch 'cryptography' -and $_ -notmatch 'UserWarning' }
 
 if ($LASTEXITCODE -ne 0) {
@@ -164,7 +213,7 @@ $ErrorActionPreference = 'Stop'
 Remove-Variable jfrogPassword, secureJFrogPassword -ErrorAction Ignore
 
 Write-Host "`n=== Update Complete ===" -ForegroundColor Cyan
-Write-Host "The Container App '$ContainerAppName' has been updated with image: $FullImageWithTag" -ForegroundColor Green
+Write-Host "The Container App '$ContainerAppName' has been updated with image: $FullImageWithTagForACA" -ForegroundColor Green
 Write-Host "Environment variables and secrets remain unchanged." -ForegroundColor Green
 Write-Host ""
 
@@ -233,7 +282,7 @@ Write-Host "`nWaiting for new image to become active and healthy..." -Foreground
 $maxAttempts = 60  # 10 minutes (60 * 10 seconds)
 $attemptCount = 0
 $isReady = $false
-$imageName = $FullImageWithTag
+$imageName = $FullImageWithTagForACA
 
 while ($attemptCount -lt $maxAttempts -and -not $isReady) {
     $attemptCount++

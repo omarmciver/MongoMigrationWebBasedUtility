@@ -665,11 +665,14 @@ namespace OnlineMongoMigrationProcessor
                 // Add sample stage
                 var sampleStage = new BsonDocument("$sample", new BsonDocument("size", sampleSize));
 
+                // Only project _id to avoid full-document deserialization issues.
+                var projectStage = new BsonDocument("$project", new BsonDocument("_id", 1));
+
                 // Add sort by _id to ensure consistent ordering
                 var sortStage = new BsonDocument("$sort", new BsonDocument("_id", 1));
 
                 // Execute aggregation
-                var pipeline = matchStages.Concat(new[] { sampleStage, sortStage }).ToList();
+                var pipeline = matchStages.Concat(new[] { sampleStage, projectStage, sortStage }).ToList();
 
                 var samples = await collection.Aggregate<BsonDocument>(pipeline)
                     .ToListAsync()

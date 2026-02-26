@@ -6,7 +6,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
-using System.Text;
 
 namespace OnlineMongoMigrationProcessor.Helpers
 {
@@ -54,8 +53,8 @@ namespace OnlineMongoMigrationProcessor.Helpers
                     var sourceDb = sourceClient.GetDatabase(mu.DatabaseName);
                     var targetDb = targetClient.GetDatabase(mu.DatabaseName);
 
-                    var sourceCollection = sourceDb.GetCollection<BsonDocument>(mu.CollectionName);
-                    var targetCollection = targetDb.GetCollection<BsonDocument>(mu.CollectionName);
+                    var sourceCollection = sourceDb.GetCollection<RawBsonDocument>(mu.CollectionName);
+                    var targetCollection = targetDb.GetCollection<RawBsonDocument>(mu.CollectionName);
 
                     DateTime currTime = DateTime.UtcNow;
 
@@ -68,13 +67,13 @@ namespace OnlineMongoMigrationProcessor.Helpers
 
                     if (userFilterDoc.ElementCount > 0)
                     {
-                        agg = agg.Match(userFilterDoc);
+                        agg = agg.Match(new BsonDocumentFilterDefinition<RawBsonDocument>(userFilterDoc));
                     }
 
 #if LEGACY_MONGODB_DRIVER
                     // Sample() not available in legacy driver; use $sample aggregation stage directly
                     var randomDocsCursor = await agg
-                        .AppendStage<BsonDocument>(new BsonDocument("$sample", new BsonDocument("size", config.CompareSampleSize)))
+                        .AppendStage<RawBsonDocument>(new BsonDocument("$sample", new BsonDocument("size", config.CompareSampleSize)))
                         .ToCursorAsync(cancellationToken);
 #else
                     var randomDocsCursor = await agg
@@ -90,8 +89,15 @@ namespace OnlineMongoMigrationProcessor.Helpers
                     {
                         cancellationToken.ThrowIfCancellationRequested();
 
+                        if (!sourceDoc.Contains("_id"))
+                        {
+                            log.WriteLine($"Error found in {mu.DatabaseName}.{mu.CollectionName}: Sampled document missing _id.", LogType.Error);
+                            mismatched++;
+                            continue;
+                        }
+
                         var id = sourceDoc.GetValue("_id");
-                        var filter = Builders<BsonDocument>.Filter.Eq("_id", id);
+                        var filter = Builders<RawBsonDocument>.Filter.Eq("_id", id);
 
                         var targetDoc = await targetCollection.Find(filter)
                             .FirstOrDefaultAsync(cancellationToken);
@@ -130,12 +136,11 @@ namespace OnlineMongoMigrationProcessor.Helpers
             }
         }
 
-        private static string ComputeHash(BsonDocument doc)
+        private static string ComputeHash(RawBsonDocument doc)
         {
             using (var sha = SHA256.Create())
             {
-                var json = doc.ToJson();
-                var bytes = Encoding.UTF8.GetBytes(json);
+                var bytes = doc.ToBson();
                 var hashBytes = sha.ComputeHash(bytes);
                 return BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
             }

@@ -1,4 +1,5 @@
 using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using OnlineMongoMigrationProcessor.Context;
 using OnlineMongoMigrationProcessor.Helpers.JobManagement;
@@ -1295,7 +1296,11 @@ namespace OnlineMongoMigrationProcessor
 
             var bsonDoc = BsonDocument.Parse(documentKey);
             var filter = MongoHelper.BuildFilterFromDocumentKey(bsonDoc);
-            var result = sourceCollection.Find(filter).FirstOrDefault(); // Retrieve the document for the resume token
+            var sourceRawCollection = sourceCollection.Database.GetCollection<RawBsonDocument>(sourceCollection.CollectionNamespace.CollectionName);
+            var targetRawCollection = targetCollection.Database.GetCollection<RawBsonDocument>(targetCollection.CollectionNamespace.CollectionName);
+            var renderedFilter = RenderFilterForRawCollection(filter);
+            var rawFilter = new BsonDocumentFilterDefinition<RawBsonDocument>(renderedFilter);
+            var result = sourceRawCollection.Find(rawFilter).FirstOrDefault(); // Retrieve the document for the resume token
 
             try
             {
@@ -1308,7 +1313,7 @@ namespace OnlineMongoMigrationProcessor
                             _log.WriteLine($"{_syncBackPrefix}No document found for insert operation with document key {documentKey} in {sourceCollection.CollectionNamespace}. Skipping insert.", LogType.Warning);
                             return true; // Skip if no document found
                         }
-                        targetCollection.InsertOne(result);
+                        targetRawCollection.InsertOne(result);
                         IncrementDocCounter(mu, opType);
                         return true;
                     case ChangeStreamOperationType.Update:
@@ -1319,7 +1324,7 @@ namespace OnlineMongoMigrationProcessor
                             try
                             {
                                 // Use DocumentKey-based filter for sharded collections
-                                targetCollection.DeleteOne(filter);
+                                targetRawCollection.DeleteOne(rawFilter);
                                 IncrementDocCounter(mu, ChangeStreamOperationType.Delete);
                             }
                             catch
@@ -1329,13 +1334,13 @@ namespace OnlineMongoMigrationProcessor
                         else
                         {
                             // Use DocumentKey-based filter for sharded collections with upsert
-                            targetCollection.ReplaceOne(filter, result, new ReplaceOptions { IsUpsert = true });
+                            targetRawCollection.ReplaceOne(rawFilter, result, new ReplaceOptions { IsUpsert = true });
                             IncrementDocCounter(mu, opType);
                             return true;
                         }
                     case ChangeStreamOperationType.Delete:
                         // Use DocumentKey-based filter for sharded collections
-                        targetCollection.DeleteOne(filter);
+                        targetRawCollection.DeleteOne(rawFilter);
                         IncrementDocCounter(mu, opType);
                         return true;
                     default:
@@ -1461,7 +1466,13 @@ namespace OnlineMongoMigrationProcessor
             }
         }
 
-
+        private static BsonDocument RenderFilterForRawCollection(FilterDefinition<BsonDocument> filter)
+        {
+            var serializerRegistry = BsonSerializer.SerializerRegistry;
+            var documentSerializer = serializerRegistry.GetSerializer<BsonDocument>();
+            var renderArgs = new RenderArgs<BsonDocument>(documentSerializer, serializerRegistry);
+            return filter.Render(renderArgs);
+        }
 
     }
 }

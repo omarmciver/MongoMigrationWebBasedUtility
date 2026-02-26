@@ -247,8 +247,10 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                 // Get source and target collections
                 var sourceDb = sourceClient.GetDatabase(sourceDatabaseName);
                 var sourceCollection = sourceDb.GetCollection<BsonDocument>(sourceCollectionName);
+                var sourceRawCollection = sourceDb.GetCollection<RawBsonDocument>(sourceCollectionName);
                 var targetDb = _targetClient.GetDatabase(sourceDatabaseName);
                 var targetCollection = targetDb.GetCollection<BsonDocument>(sourceCollectionName);
+                var targetRawCollection = targetDb.GetCollection<RawBsonDocument>(sourceCollectionName);
 
                 long totalInserted = 0;
                 long totalUpdated = 0;
@@ -292,8 +294,8 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                     // Read documents from source and process inserts
                     if (insertKeys.Count > 0)
                     {
-                        var insertDocs = await ReadDocumentsFromSourceAsync(sourceCollection, insertKeys);
-                        var (inserted, skipped) = await ProcessStoredInsertsAsync(targetCollection, insertDocs, operationBatchSize, sourceDatabaseName, sourceCollectionName, pageNumber);
+                        var insertDocs = await ReadDocumentsFromSourceAsync(sourceRawCollection, insertKeys);
+                        var (inserted, skipped) = await ProcessStoredInsertsAsync(targetRawCollection, insertDocs, operationBatchSize, sourceDatabaseName, sourceCollectionName, pageNumber);
                         totalInserted += inserted;
                         totalSkipped += skipped;
                     }
@@ -301,8 +303,8 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                     // Read documents from source and process updates
                     if (updateKeys.Count > 0)
                     {
-                        var updateDocs = await ReadDocumentsFromSourceAsync(sourceCollection, updateKeys);
-                        var (updated, skipped) = await ProcessStoredUpdatesAsync(targetCollection, updateDocs, operationBatchSize, sourceDatabaseName, sourceCollectionName, pageNumber);
+                        var updateDocs = await ReadDocumentsFromSourceAsync(sourceRawCollection, updateKeys);
+                        var (updated, skipped) = await ProcessStoredUpdatesAsync(targetRawCollection, updateDocs, operationBatchSize, sourceDatabaseName, sourceCollectionName, pageNumber);
                         totalUpdated += updated;
                         totalSkipped += skipped;
                     }
@@ -321,8 +323,8 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
             }
         }
 
-        private async Task<List<BsonDocument>> ReadDocumentsFromSourceAsync(
-            IMongoCollection<BsonDocument> sourceCollection,
+        private async Task<List<RawBsonDocument>> ReadDocumentsFromSourceAsync(
+            IMongoCollection<RawBsonDocument> sourceCollection,
             List<BsonDocument> documentKeys)
         {
             MigrationJobContext.AddVerboseLog($"Processing ReadDocumentsFromSourceAsync for {sourceCollection.Database.DatabaseNamespace.DatabaseName}.{sourceCollection.CollectionNamespace.CollectionName} documentKeysCount= {documentKeys.Count}");
@@ -337,11 +339,11 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
 
                 if (ids.Count == 0)
                 {
-                    return new List<BsonDocument>();
+                    return new List<RawBsonDocument>();
                 }
 
                 // Read documents from source
-                var filter = Builders<BsonDocument>.Filter.In("_id", ids);
+                var filter = Builders<RawBsonDocument>.Filter.In("_id", ids);
                 var documents = await sourceCollection.Find(filter).ToListAsync();
 
                 return documents;
@@ -349,13 +351,13 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
             catch (Exception ex)
             {
                 _log.WriteLine($"Error reading documents from source. Details {ex}", LogType.Error);
-                return new List<BsonDocument>();
+                return new List<RawBsonDocument>();
             }
         }
 
         private async Task<(long Inserted, long Skipped)> ProcessStoredInsertsAsync(
-            IMongoCollection<BsonDocument> targetCollection,
-            List<BsonDocument> documents,
+            IMongoCollection<RawBsonDocument> targetCollection,
+            List<RawBsonDocument> documents,
             int batchSize,
             string databaseName,
             string collectionName,
@@ -372,10 +374,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                 var batch = documents.Skip(i).Take(batchSize).ToList();
                 var insertModels = batch.Select(doc =>
                 {
-                    var id = doc["_id"];
-                    if (id.IsObjectId)
-                        doc["_id"] = id.AsObjectId;
-                    return new InsertOneModel<BsonDocument>(doc);
+                    return new InsertOneModel<RawBsonDocument>(doc);
                 }).ToList();
 
                 if (insertModels.Count > 0)
@@ -387,7 +386,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                         _log.ShowInMonitor($"Inserted {result.InsertedCount} documents into {databaseName}.{collectionName} (page {pageNumber + 1}, batch {i / batchSize + 1})");
                         MigrationJobContext.AddVerboseLog($"ProcessStoredInsertsAsync inserted for {databaseName}.{collectionName} , {result.InsertedCount} documents into {databaseName}.{collectionName} (page {pageNumber + 1}, batch {i / batchSize + 1})");
                     }
-                    catch (MongoBulkWriteException<BsonDocument> ex)
+                    catch (MongoBulkWriteException<RawBsonDocument> ex)
                     {
                         totalInserted += ex.Result?.InsertedCount ?? 0;
                         var duplicateErrors = ex.WriteErrors.Count(e => e.Code == 11000);
@@ -407,8 +406,8 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
         }
 
         private async Task<(long Updated, long Skipped)> ProcessStoredUpdatesAsync(
-            IMongoCollection<BsonDocument> targetCollection,
-            List<BsonDocument> documents,
+            IMongoCollection<RawBsonDocument> targetCollection,
+            List<RawBsonDocument> documents,
             int batchSize,
             string databaseName,
             string collectionName,
@@ -435,8 +434,8 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                     if (id.IsObjectId)
                         id = id.AsObjectId;
                     
-                    var filter = Builders<BsonDocument>.Filter.Eq("_id", id);
-                    return new ReplaceOneModel<BsonDocument>(filter, doc) { IsUpsert = true };
+                    var filter = Builders<RawBsonDocument>.Filter.Eq("_id", id);
+                    return new ReplaceOneModel<RawBsonDocument>(filter, doc) { IsUpsert = true };
                 }).ToList();
 
                 if (updateModels.Count > 0)
@@ -448,7 +447,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                         _log.ShowInMonitor($"Updated {result.ModifiedCount + result.Upserts.Count} documents in {databaseName}.{collectionName} (page {pageNumber + 1}, batch {i / batchSize + 1})");
                         MigrationJobContext.AddVerboseLog($"ProcessStoredInsertsAsync updated for {databaseName}.{collectionName} , {result.InsertedCount} documents into {databaseName}.{collectionName} (page {pageNumber + 1}, batch {i / batchSize + 1})");
                     }
-                    catch (MongoBulkWriteException<BsonDocument> ex)
+                    catch (MongoBulkWriteException<RawBsonDocument> ex)
                     {
                         totalUpdated += (ex.Result?.ModifiedCount ?? 0) + (ex.Result?.Upserts?.Count ?? 0);
                         var duplicateErrors = ex.WriteErrors.Count(e => e.Code == 11000);

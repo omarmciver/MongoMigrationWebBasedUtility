@@ -653,7 +653,11 @@ namespace OnlineMongoMigrationProcessor
                 sourceCollection = sourceDb.GetCollection<BsonDocument>(collectionName);
             }
 
-            var result = sourceCollection.Find(filter).FirstOrDefault();
+            var sourceRawCollection = sourceCollection.Database.GetCollection<RawBsonDocument>(sourceCollection.CollectionNamespace.CollectionName);
+            var targetRawCollection = targetCollection.Database.GetCollection<RawBsonDocument>(targetCollection.CollectionNamespace.CollectionName);
+            var renderedFilter = RenderFilterForRawCollection(filter);
+            var rawFilter = new BsonDocumentFilterDefinition<RawBsonDocument>(renderedFilter);
+            var result = sourceRawCollection.Find(rawFilter).FirstOrDefault();
 
             try
             {
@@ -669,7 +673,7 @@ namespace OnlineMongoMigrationProcessor
                             _log.WriteLine($"No document found for insert operation with document key {documentKey} in {collectionKey}. Skipping insert.");
                             return true;
                         }
-                        targetCollection.InsertOne(result);
+                        targetRawCollection.InsertOne(result);
                         IncrementDocCounter(migrationUnit, operationType);
                         return true;
 
@@ -681,7 +685,7 @@ namespace OnlineMongoMigrationProcessor
                             try
                             {
                                 // Use DocumentKey-based filter for sharded collections
-                                targetCollection.DeleteOne(filter);
+                                targetRawCollection.DeleteOne(rawFilter);
                                 IncrementDocCounter(migrationUnit, ChangeStreamOperationType.Delete);
                             }
                             catch { }
@@ -690,14 +694,14 @@ namespace OnlineMongoMigrationProcessor
                         else
                         {
                             // Use DocumentKey-based filter for sharded collections with upsert
-                            targetCollection.ReplaceOne(filter, result, new ReplaceOptions { IsUpsert = true });
+                            targetRawCollection.ReplaceOne(rawFilter, result, new ReplaceOptions { IsUpsert = true });
                             IncrementDocCounter(migrationUnit, operationType);
                             return true;
                         }
 
                     case ChangeStreamOperationType.Delete:
                         // Use DocumentKey-based filter for sharded collections
-                        targetCollection.DeleteOne(filter);
+                        targetRawCollection.DeleteOne(rawFilter);
                         IncrementDocCounter(migrationUnit, operationType);
                         return true;
 
@@ -911,6 +915,14 @@ namespace OnlineMongoMigrationProcessor
                 MigrationJobContext.CurrentlyActiveJob.SyncBackResumeDocumentKey = documentId;
                 MigrationJobContext.CurrentlyActiveJob.SyncBackResumeCollectionKey = collectionKey;
             }
+        }
+
+        private static BsonDocument RenderFilterForRawCollection(FilterDefinition<BsonDocument> filter)
+        {
+            var serializerRegistry = BsonSerializer.SerializerRegistry;
+            var documentSerializer = serializerRegistry.GetSerializer<BsonDocument>();
+            var renderArgs = new RenderArgs<BsonDocument>(documentSerializer, serializerRegistry);
+            return filter.Render(renderArgs);
         }
 
         #endregion

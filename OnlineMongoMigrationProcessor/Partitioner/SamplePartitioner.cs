@@ -225,6 +225,9 @@ namespace OnlineMongoMigrationProcessor
                     if (optimizeForObjectId && dataType == DataType.ObjectId && config.ObjectIdPartitioner == PartitionerType.UseSampleCommand)
                         skipDataTypeFilter = true;
 
+                    if (dataType != DataType.ObjectId && config.NonObjectIdPartitioner == PartitionerType.UsePagination)
+                        return GetChunkBoundariesGeneralWithPagination(log, collection, dataType, userFilter, skipDataTypeFilter, sampleCount, segmentCount, docCountByType);
+
                     return GetChunkBoundariesGeneral(log, collection, optimizeForMongoDump, dataType, userFilter, skipDataTypeFilter, sampleCount, chunkCount, segmentCount);
                 }
 
@@ -369,6 +372,122 @@ namespace OnlineMongoMigrationProcessor
             {
                 log.WriteLine($"Total Chunks: {chunkBoundaries.Boundaries.Count} where _id is {dataType}");
             }
+            return chunkBoundaries;
+        }
+
+        private static ChunkBoundaries? GetChunkBoundariesGeneralWithPagination(Log log, IMongoCollection<BsonDocument> collection, DataType dataType, BsonDocument userFilter, bool skipDataTypeFilter, long sampleCount, int segmentCount, long docCountByType)
+        {
+            ChunkBoundaries chunkBoundaries = new ChunkBoundaries();
+            var rawCollection = collection.Database.GetCollection<RawBsonDocument>(collection.CollectionNamespace.CollectionName);
+
+            Boundary? chunkBoundary = null;
+            if (sampleCount <= 1 || dataType == DataType.Other)
+            {
+                chunkBoundary = new Boundary
+                {
+                    StartId = BsonNull.Value,
+                    EndId = BsonNull.Value,
+                    SegmentBoundaries = new List<Boundary>()
+                };
+                chunkBoundaries.Boundaries ??= new List<Boundary>();
+                chunkBoundaries.Boundaries.Add(chunkBoundary);
+                log.WriteLine($"Chunk Count: {chunkBoundaries.Boundaries.Count} where _id is {dataType}");
+                return chunkBoundaries;
+            }
+
+            if (!MongoHelper.UsesIdFieldInFilter(userFilter!))
+            {
+                userFilter = MongoHelper.GetFilterDoc("");
+            }
+
+            BsonDocument matchCondition = BuildDataTypeCondition(dataType, userFilter, skipDataTypeFilter);
+            FilterDefinition<RawBsonDocument> baseFilter = (matchCondition != null && matchCondition.ElementCount > 0)
+                ? new BsonDocumentFilterDefinition<RawBsonDocument>(matchCondition)
+                : FilterDefinition<RawBsonDocument>.Empty;
+
+            long recordsPerRange = Math.Max(1, docCountByType / sampleCount);
+            int skipCount = (int)Math.Min(recordsPerRange - 1, int.MaxValue - 1);
+
+            if (skipDataTypeFilter)
+            {
+                log.WriteLine($"Using pagination for {collection.CollectionNamespace} (DataType filtering bypassed), records per range: {recordsPerRange}, sample count: {sampleCount}");
+            }
+            else
+            {
+                log.WriteLine($"Using pagination for {collection.CollectionNamespace} where _id is {dataType}, records per range: {recordsPerRange}, sample count: {sampleCount}");
+            }
+
+            List<BsonValue> partitionValues = new List<BsonValue>();
+            BsonValue? lastId = null;
+
+            for (int i = 0; i < sampleCount; i++)
+            {
+                try
+                {
+                    FilterDefinition<RawBsonDocument> rangeFilter = baseFilter;
+                    if (lastId != null)
+                    {
+                        rangeFilter = Builders<RawBsonDocument>.Filter.And(
+                            baseFilter,
+                            Builders<RawBsonDocument>.Filter.Gt("_id", lastId));
+                    }
+
+                    var doc = rawCollection
+                        .Find(rangeFilter)
+                        .Sort(Builders<RawBsonDocument>.Sort.Ascending("_id"))
+                        .Project(Builders<RawBsonDocument>.Projection.Include("_id"))
+                        .Skip(skipCount)
+                        .Limit(1)
+                        .FirstOrDefault();
+
+                    if (doc == null || !doc.Contains("_id"))
+                    {
+                        break;
+                    }
+
+                    var currentId = doc["_id"];
+                    if (currentId == BsonNull.Value)
+                    {
+                        break;
+                    }
+
+                    lastId = currentId;
+                    partitionValues.Add(currentId);
+                }
+                catch (Exception ex)
+                {
+                    log.WriteLine($"Encountered error in attempt {i} while paginating data where _id is {dataType}: {ex}");
+                }
+            }
+
+            partitionValues = partitionValues
+                .Distinct()
+                .OrderBy(value => value)
+                .ToList();
+
+            if (partitionValues.Count == 0)
+            {
+                if (skipDataTypeFilter)
+                {
+                    log.WriteLine("No data found while generating pagination boundaries (DataType filtering bypassed)");
+                }
+                else
+                {
+                    log.WriteLine($"No data found while generating pagination boundaries where _id is {dataType}");
+                }
+                return null;
+            }
+
+            chunkBoundaries = ConvertToBoundaries(partitionValues, segmentCount);
+            if (skipDataTypeFilter)
+            {
+                log.WriteLine($"Total Chunks: {chunkBoundaries.Boundaries.Count} (DataType filtering bypassed) using pagination");
+            }
+            else
+            {
+                log.WriteLine($"Total Chunks: {chunkBoundaries.Boundaries.Count} where _id is {dataType} using pagination");
+            }
+
             return chunkBoundaries;
         }
 

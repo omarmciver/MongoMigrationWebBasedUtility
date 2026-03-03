@@ -61,6 +61,15 @@
                         </select>
                     </div>
                     <div class="mb-3">
+                        <label for="non-objectid-partitioner" class="form-label" title="Choose the method for partitioning non-ObjectId collections into chunks for parallel processing.">
+                            Non ObjectId Partitioner
+                        </label>
+                        <select id="non-objectid-partitioner" value="@SelectedNonObjectIdPartitioner" class="form-select" @onchange="OnNonObjectIdPartitionerChanged">
+                            <option value="UseSampleCommand" title="Use MongoDB's $sample command to generate chunk boundaries.">Use Sample Command</option>
+                            <option value="UsePagination" title="Use pagination to create chunks of same size.">Use Pagination</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
                         <label for="pem-text" class="form-label">CA certificate file for source server (.pem)</label>
                         <InputFile OnChange="OnPemFileUpload" />
 
@@ -134,6 +143,7 @@
     private const string MongoToolsUrlPlaceholder = "Single URL: https://.../mongodb-database-tools-....zip\nJSON: {\"MongoDumpURL\":\"https://...dump.zip\",\"MongoRestoreURL\":\"https://...restore.zip\"}";
 
     private string SelectedObjectIdPartitioner = "UseTimeBoundaries"; // Default partitioner
+    private string SelectedNonObjectIdPartitioner = "UseSampleCommand"; // Default partitioner
 
     private void SwitchToOfflineDataMovementTab()
     {
@@ -162,6 +172,17 @@
         }
     }
 
+    private void OnNonObjectIdPartitionerChanged(ChangeEventArgs e)
+    {
+        var val = e?.Value?.ToString() ?? "UseSampleCommand";
+        SelectedNonObjectIdPartitioner = val;
+
+        if (Enum.TryParse<OnlineMongoMigrationProcessor.PartitionerType>(val, out var partitionerType))
+        {
+            (_configurationBackup ??= new OnlineMongoMigrationProcessor.MigrationSettings()).NonObjectIdPartitioner = partitionerType;
+        }
+    }
+
     private void ClearPem()
     {
         (_configurationBackup ??= new OnlineMongoMigrationProcessor.MigrationSettings()).CACertContentsForSourceServer = string.Empty;
@@ -183,6 +204,7 @@
         
         // Initialize the selected partitioner from the configuration
         SelectedObjectIdPartitioner = _configurationBackup.ObjectIdPartitioner.ToString();
+        SelectedNonObjectIdPartitioner = _configurationBackup.NonObjectIdPartitioner.ToString();
     }
 
 

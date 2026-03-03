@@ -22,6 +22,7 @@ namespace OnlineMongoMigrationProcessor
 		public int MongoCopyPageSize { get; set; }
         public int CompareSampleSize { get; set; }
         public PartitionerType ObjectIdPartitioner { get; set; }
+        public PartitionerType NonObjectIdPartitioner { get; set; }
         
         private string _filePath = string.Empty;
 
@@ -61,6 +62,7 @@ namespace OnlineMongoMigrationProcessor
                     LogPageSize = loadedObject.LogPageSize == 0 ? 5000 : loadedObject.LogPageSize;
                     CACertContentsForSourceServer = loadedObject.CACertContentsForSourceServer;
                     ObjectIdPartitioner = loadedObject.ObjectIdPartitioner;
+                    NonObjectIdPartitioner = loadedObject.NonObjectIdPartitioner;
                     
                     initialized = true;
                     if (ChangeStreamMaxDocsInBatch > 10000)
@@ -89,6 +91,7 @@ namespace OnlineMongoMigrationProcessor
                 CompareSampleSize = 50;
                 LogPageSize = 5000;
                 ObjectIdPartitioner = PartitionerType.UseSampleCommand;
+                NonObjectIdPartitioner = PartitionerType.UseSampleCommand;
             }
         }
 

@@ -921,8 +921,12 @@ namespace OnlineMongoMigrationProcessor
         {
             var serializerRegistry = BsonSerializer.SerializerRegistry;
             var documentSerializer = serializerRegistry.GetSerializer<BsonDocument>();
+#if LEGACY_MONGODB_DRIVER
+            return filter.Render(documentSerializer, serializerRegistry);
+#else
             var renderArgs = new RenderArgs<BsonDocument>(documentSerializer, serializerRegistry);
             return filter.Render(renderArgs);
+#endif
         }
 
         #endregion

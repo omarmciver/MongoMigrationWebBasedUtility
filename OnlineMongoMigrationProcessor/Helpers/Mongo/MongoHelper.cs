@@ -1292,7 +1292,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
 
             if (!(lte == null || lte.IsBsonNull) && lte is not BsonMaxKey)
             {
-                idConditions.Add($"\\\"$lte\\\": {BsonValueToString(lte, dataType)}");
+                idConditions.Add($"\\\"$lt\\\": {BsonValueToString(lte, dataType)}");
             }
 
             var rootConditions = new List<string>();

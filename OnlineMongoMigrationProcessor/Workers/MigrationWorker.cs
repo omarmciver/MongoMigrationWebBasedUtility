@@ -2050,14 +2050,36 @@ namespace OnlineMongoMigrationProcessor.Workers
 
                 if (MigrationJobContext.CurrentlyActiveJob!.JobType == JobType.MongoDriver && boundary.SegmentBoundaries != null && boundary.SegmentBoundaries.Count > 0)
                 {
-                    _log.WriteLine($"Creating {boundary.SegmentBoundaries.Count} segments for boundary {i}", LogType.Debug);
+                    int totalSegmentsToCreate = boundary.SegmentBoundaries.Count + 1;
+                    _log.WriteLine($"Creating {totalSegmentsToCreate} segments for boundary {i}", LogType.Debug);
+
+                    chunk.Segments ??= new List<Segment>();
+
+                    string chunkStart = chunk.Gte ?? string.Empty;
+                    string chunkEnd = chunk.Lt ?? string.Empty;
+
+                    string firstSegmentEnd = boundary.SegmentBoundaries[0].StartId?.ToString() ?? chunkEnd;
+                    chunk.Segments.Add(new Segment
+                    {
+                        Gte = chunkStart,
+                        Lt = firstSegmentEnd,
+                        IsProcessed = false,
+                        Id = "1"
+                    });
+
                     for (int j = 0; j < boundary.SegmentBoundaries.Count; j++)
                     {
-                        var segment = boundary.SegmentBoundaries[j];
-                        var (segmentStartId, segmentEndId) = GetStartEnd(false, segment, boundary.SegmentBoundaries.Count, j, userFilter, chunk.Lt ?? string.Empty, chunk.Gte ?? string.Empty);
+                        var segmentBoundary = boundary.SegmentBoundaries[j];
+                        string segmentStartId = segmentBoundary.StartId?.ToString() ?? string.Empty;
+                        string segmentEndId = segmentBoundary.EndId?.ToString() ?? chunkEnd;
 
-                        chunk.Segments ??= new List<Segment>();
-                        chunk.Segments.Add(new Segment { Gte = segmentStartId, Lt = segmentEndId, IsProcessed = false, Id = (j + 1).ToString() });
+                        chunk.Segments.Add(new Segment
+                        {
+                            Gte = segmentStartId,
+                            Lt = segmentEndId,
+                            IsProcessed = false,
+                            Id = (j + 2).ToString()
+                        });
                     }
                 }
             }

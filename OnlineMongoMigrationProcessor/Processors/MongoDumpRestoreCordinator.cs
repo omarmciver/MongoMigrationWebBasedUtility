@@ -75,11 +75,21 @@ namespace OnlineMongoMigrationProcessor
         private readonly object _pidLock = new object();
         private readonly object _timerLock = new object();
         private readonly object _diskSpaceCheckLock = new object();
+        private readonly object _workingSetLock = new object();
+
+        private const int MaxManifestWorkingSetSize = 200;
+        private const int MaxActiveMigrationUnitsWorkingSetSize = 200;
 
         // Coordinated processing infrastructure (shared across all migration units)
         private readonly ConcurrentDictionary<string, DumpRestoreProcessContext> _downloadManifest = new();
         private readonly ConcurrentDictionary<string, DumpRestoreProcessContext> _uploadManifest = new();
         private readonly ConcurrentDictionary<string, MigrationUnitTracker> _activeMigrationUnits = new();
+        private readonly ConcurrentQueue<DumpRestoreProcessContext> _downloadBacklog = new();
+        private readonly ConcurrentQueue<DumpRestoreProcessContext> _uploadBacklog = new();
+        private readonly ConcurrentDictionary<string, byte> _downloadBacklogIndex = new();
+        private readonly ConcurrentDictionary<string, byte> _uploadBacklogIndex = new();
+        private readonly ConcurrentQueue<ProcessorContext> _pendingMigrationUnits = new();
+        private readonly ConcurrentDictionary<string, byte> _pendingMigrationUnitIndex = new();
         private System.Timers.Timer? _processTimer;
         private readonly int _timerIntervalMs = 2000; // Check every 2 seconds
         private bool _coordinatorInitialized = false;
@@ -104,6 +114,188 @@ namespace OnlineMongoMigrationProcessor
         private (bool exclusiveDump, bool exclusiveRestore) GetExclusiveModeFlags()
         {
             return (IsEnvVarTrue(ExclusiveDumpModeEnvVar), IsEnvVarTrue(ExclusiveRestoreModeEnvVar));
+        }
+
+        private static void ClearQueue<T>(ConcurrentQueue<T> queue)
+        {
+            while (queue.TryDequeue(out _)) { }
+        }
+
+        private bool TryQueuePendingMigrationUnit(ProcessorContext context)
+        {
+            if (string.IsNullOrEmpty(context.MigrationUnitId))
+                return false;
+
+            lock (_workingSetLock)
+            {
+                if (!_pendingMigrationUnitIndex.TryAdd(context.MigrationUnitId, 0))
+                    return false;
+
+                _pendingMigrationUnits.Enqueue(context);
+                return true;
+            }
+        }
+
+        private bool TryAddDownloadContext(DumpRestoreProcessContext context)
+        {
+            lock (_workingSetLock)
+            {
+                if (_downloadManifest.ContainsKey(context.Id) || _downloadBacklogIndex.ContainsKey(context.Id))
+                    return false;
+
+                if (_downloadManifest.Count < MaxManifestWorkingSetSize)
+                    return _downloadManifest.TryAdd(context.Id, context);
+
+                _downloadBacklog.Enqueue(context);
+                _downloadBacklogIndex[context.Id] = 0;
+                return true;
+            }
+        }
+
+        private bool TryAddUploadContext(DumpRestoreProcessContext context)
+        {
+            lock (_workingSetLock)
+            {
+                if (_uploadManifest.ContainsKey(context.Id) || _uploadBacklogIndex.ContainsKey(context.Id))
+                    return false;
+
+                if (_uploadManifest.Count < MaxManifestWorkingSetSize)
+                    return _uploadManifest.TryAdd(context.Id, context);
+
+                _uploadBacklog.Enqueue(context);
+                _uploadBacklogIndex[context.Id] = 0;
+                return true;
+            }
+        }
+
+        private void RefillDownloadWorkingSet()
+        {
+            lock (_workingSetLock)
+            {
+                while (_downloadManifest.Count < MaxManifestWorkingSetSize && _downloadBacklog.TryDequeue(out var context))
+                {
+                    _downloadBacklogIndex.TryRemove(context.Id, out _);
+
+                    if (_downloadManifest.ContainsKey(context.Id))
+                        continue;
+
+                    _downloadManifest.TryAdd(context.Id, context);
+                }
+            }
+        }
+
+        private void RefillUploadWorkingSet()
+        {
+            lock (_workingSetLock)
+            {
+                while (_uploadManifest.Count < MaxManifestWorkingSetSize && _uploadBacklog.TryDequeue(out var context))
+                {
+                    _uploadBacklogIndex.TryRemove(context.Id, out _);
+
+                    if (_uploadManifest.ContainsKey(context.Id))
+                        continue;
+
+                    _uploadManifest.TryAdd(context.Id, context);
+                }
+            }
+        }
+
+        private void RefillManifestWorkingSets()
+        {
+            RefillDownloadWorkingSet();
+            RefillUploadWorkingSet();
+        }
+
+        private bool TryStartMigrationUnit(ProcessorContext ctx)
+        {
+            var mu = MigrationJobContext.GetMigrationUnit(ctx.MigrationUnitId);
+
+            if (mu == null)
+            {
+                throw new InvalidOperationException($"MigrationUnit {ctx.MigrationUnitId} not found in context");
+            }
+
+            if (mu.MigrationChunks == null || mu.MigrationChunks.Count == 0)
+            {
+                _log?.WriteLine($"Cannot start coordinated process for {mu.DatabaseName}.{mu.CollectionName} - no chunks available (may have failed during partitioning)", LogType.Warning);
+                return false;
+            }
+
+            var tracker = new MigrationUnitTracker
+            {
+                MigrationUnitId = ctx.MigrationUnitId,
+                TotalChunks = mu.MigrationChunks.Count,
+                DownloadedChunks = mu.MigrationChunks.Count(c => c.IsDownloaded == true),
+                RestoredChunks = mu.MigrationChunks.Count(c => c.IsUploaded == true),
+                AddedAt = DateTime.UtcNow
+            };
+
+            bool trackerAdded;
+            lock (_workingSetLock)
+            {
+                if (_activeMigrationUnits.ContainsKey(mu.Id))
+                    return true;
+
+                if (_activeMigrationUnits.Count >= MaxActiveMigrationUnitsWorkingSetSize)
+                {
+                    TryQueuePendingMigrationUnit(ctx);
+                    return false;
+                }
+
+                trackerAdded = _activeMigrationUnits.TryAdd(mu.Id, tracker);
+            }
+
+            if (!trackerAdded)
+                return false;
+
+            _log?.WriteLine($"Started coordinated processing for {mu.DatabaseName}.{mu.CollectionName} " +
+                          $"(Downloaded: {tracker.DownloadedChunks}/{tracker.TotalChunks}, " +
+                          $"Restored: {tracker.RestoredChunks}/{tracker.TotalChunks})", LogType.Info);
+
+            PrepareDownloadList(mu, ctx.SourceConnectionString, ctx.TargetConnectionString);
+            PrepareRestoreList(mu, ctx.SourceConnectionString, ctx.TargetConnectionString);
+            RefillManifestWorkingSets();
+
+            return true;
+        }
+
+        private void TryActivatePendingMigrationUnits()
+        {
+            if (!_processNewTasks || MigrationJobContext.ControlledPauseRequested)
+                return;
+
+            while (true)
+            {
+                ProcessorContext? queuedContext = null;
+
+                lock (_workingSetLock)
+                {
+                    if (_activeMigrationUnits.Count >= MaxActiveMigrationUnitsWorkingSetSize)
+                        break;
+
+                    if (!_pendingMigrationUnits.TryDequeue(out var nextContext))
+                        break;
+
+                    _pendingMigrationUnitIndex.TryRemove(nextContext.MigrationUnitId, out _);
+
+                    if (_activeMigrationUnits.ContainsKey(nextContext.MigrationUnitId))
+                        continue;
+
+                    queuedContext = nextContext;
+                }
+
+                if (queuedContext == null)
+                    continue;
+
+                try
+                {
+                    TryStartMigrationUnit(queuedContext);
+                }
+                catch (Exception ex)
+                {
+                    _log?.WriteLine($"Error activating queued migration unit {queuedContext.MigrationUnitId}: {Helper.RedactPii(ex.ToString())}", LogType.Error);
+                }
+            }
         }
 
         // Work item class for chunk processing
@@ -361,8 +553,8 @@ namespace OnlineMongoMigrationProcessor
             try
             {
                 return (
-                    _downloadManifest.Count(kvp => kvp.Value.State == ProcessState.Pending),
-                    _uploadManifest.Count(kvp => kvp.Value.State == ProcessState.Pending),
+                    _downloadManifest.Count(kvp => kvp.Value.State == ProcessState.Pending) + _downloadBacklogIndex.Count,
+                    _uploadManifest.Count(kvp => kvp.Value.State == ProcessState.Pending) + _uploadBacklogIndex.Count,
                     _activeMigrationUnits.Count
                 );
             }
@@ -382,8 +574,12 @@ namespace OnlineMongoMigrationProcessor
             MigrationJobContext.AddVerboseLog($"MongoDumpRestoreCordinator.IsJobComplete: activeMUs count={_activeMigrationUnits.Count}");
             try
             {
-                // Check if there are no active migration units being tracked
-                return _activeMigrationUnits.IsEmpty;
+                return _activeMigrationUnits.IsEmpty &&
+                       _pendingMigrationUnitIndex.IsEmpty &&
+                       _downloadManifest.IsEmpty &&
+                       _uploadManifest.IsEmpty &&
+                       _downloadBacklogIndex.IsEmpty &&
+                       _uploadBacklogIndex.IsEmpty;
             }
             catch (Exception ex)
             {
@@ -402,8 +598,13 @@ namespace OnlineMongoMigrationProcessor
             MigrationJobContext.AddVerboseLog($"MongoDumpRestoreCordinator.IsMigrationUnitCompleted: migrationUnitId={migrationUnitId}");
             try
             {
-                // If the migration unit is not in the active tracking dictionary, it has completed
-                return !_activeMigrationUnits.ContainsKey(migrationUnitId);
+                if (_activeMigrationUnits.ContainsKey(migrationUnitId))
+                    return false;
+
+                if (_pendingMigrationUnitIndex.ContainsKey(migrationUnitId))
+                    return false;
+
+                return true;
             }
             catch (Exception ex)
             {
@@ -443,6 +644,12 @@ namespace OnlineMongoMigrationProcessor
                     _downloadManifest.Clear();
                     _uploadManifest.Clear();
                     _activeMigrationUnits.Clear();
+                    _downloadBacklogIndex.Clear();
+                    _uploadBacklogIndex.Clear();
+                    _pendingMigrationUnitIndex.Clear();
+                    ClearQueue(_downloadBacklog);
+                    ClearQueue(_uploadBacklog);
+                    ClearQueue(_pendingMigrationUnits);
 
                     // Dispose worker pools
                     _dumpPool?.Dispose();
@@ -505,6 +712,8 @@ namespace OnlineMongoMigrationProcessor
 
                 if (_processNewTasks)
                 { 
+                    TryActivatePendingMigrationUnits();
+                    RefillManifestWorkingSets();
                     ProcessPendingDumps();
                     ProcessPendingRestores();
                 }
@@ -543,41 +752,20 @@ namespace OnlineMongoMigrationProcessor
                     throw new InvalidOperationException("Coordinator must be initialized before starting coordinated process. Call Initialize() first.");
                 }
 
-
-                var mu= MigrationJobContext.GetMigrationUnit(ctx.MigrationUnitId);
-                
-                // Validate migration unit and chunks exist
-                if (mu == null)
+                if (_activeMigrationUnits.ContainsKey(ctx.MigrationUnitId) || _pendingMigrationUnitIndex.ContainsKey(ctx.MigrationUnitId))
                 {
-                    throw new InvalidOperationException($"MigrationUnit {ctx.MigrationUnitId} not found in context");
-                }
-                
-                if (mu.MigrationChunks == null || mu.MigrationChunks.Count == 0)
-                {
-                    _log?.WriteLine($"Cannot start coordinated process for {mu.DatabaseName}.{mu.CollectionName} - no chunks available (may have failed during partitioning)", LogType.Warning);
+                    _log?.WriteLine($"Migration unit already active or queued: {ctx.MigrationUnitId}", LogType.Debug);
                     return;
                 }
-                
-                // Add to active migration units
-                var tracker = new MigrationUnitTracker
+
+                if (!TryStartMigrationUnit(ctx))
                 {
-                    MigrationUnitId = ctx.MigrationUnitId,
-                    TotalChunks = mu.MigrationChunks.Count,
-                    DownloadedChunks = mu.MigrationChunks.Count(c => c.IsDownloaded == true),
-                    RestoredChunks = mu.MigrationChunks.Count(c => c.IsUploaded == true),
-                    AddedAt = DateTime.UtcNow
-                };
-#pragma warning restore CS8601 // Possible null reference assignment.
-
-                _activeMigrationUnits.TryAdd(mu.Id, tracker);
-
-                _log?.WriteLine($"Started coordinated processing for {mu.DatabaseName}.{mu.CollectionName} " +
-                              $"(Downloaded: {tracker.DownloadedChunks}/{tracker.TotalChunks}, " +
-                              $"Restored: {tracker.RestoredChunks}/{tracker.TotalChunks})", LogType.Info);
-
-                // Prepare manifests with connection strings from context
-                PrepareDownloadList(mu, ctx.SourceConnectionString, ctx.TargetConnectionString);
-                PrepareRestoreList(mu, ctx.SourceConnectionString, ctx.TargetConnectionString);
+                    if (_pendingMigrationUnitIndex.ContainsKey(ctx.MigrationUnitId))
+                    {
+                        _log?.WriteLine($"Active migration unit working set is full ({MaxActiveMigrationUnitsWorkingSetSize}). Queued {ctx.MigrationUnitId}.", LogType.Debug);
+                    }
+                    return;
+                }
 
                 // Start timer if not already running
                 lock (_timerLock)
@@ -615,26 +803,22 @@ namespace OnlineMongoMigrationProcessor
                     if (chunk.IsDownloaded != true)
                     {
                         string contextId = $"{mu.Id}_{i}";
-
-                        if (!_downloadManifest.ContainsKey(contextId))
+                        var context = new DumpRestoreProcessContext
                         {
-                            var context = new DumpRestoreProcessContext
-                            {
-                                Id = contextId,
-                                MigrationUnitId = mu.Id,
-                                ChunkIndex = i,
-                                State = ProcessState.Pending,
-                                QueuedAt = DateTime.UtcNow,
-                                RetryCount = 0,
-                                SourceConnectionString = sourceConnectionString,
-                                TargetConnectionString = targetConnectionString
-                            };
+                            Id = contextId,
+                            MigrationUnitId = mu.Id,
+                            ChunkIndex = i,
+                            State = ProcessState.Pending,
+                            QueuedAt = DateTime.UtcNow,
+                            RetryCount = 0,
+                            SourceConnectionString = sourceConnectionString,
+                            TargetConnectionString = targetConnectionString
+                        };
 
-                            if (_downloadManifest.TryAdd(contextId, context))
-                            {
-                                _log.WriteLine($"{mu.DatabaseName}.{mu.CollectionName}[{i}] added to download manifest", LogType.Debug);
-                                addedCount++;
-                            }
+                        if (TryAddDownloadContext(context))
+                        {
+                            _log.WriteLine($"{mu.DatabaseName}.{mu.CollectionName}[{i}] accepted for download processing", LogType.Debug);
+                            addedCount++;
                         }
                     }
                 }
@@ -667,26 +851,22 @@ namespace OnlineMongoMigrationProcessor
                     if (chunk.IsDownloaded != true)
                     {
                         string contextId = $"{mu.Id}_{i}";
-
-                        if (!_downloadManifest.ContainsKey(contextId))
+                        var context = new DumpRestoreProcessContext
                         {
-                            var context = new DumpRestoreProcessContext
-                            {
-                                Id = contextId,
-                                MigrationUnitId = mu.Id,
-                                ChunkIndex = i,
-                                State = ProcessState.Pending,
-                                QueuedAt = DateTime.UtcNow,
-                                RetryCount = 0,
-                                SourceConnectionString = sourceConnectionString,
-                                TargetConnectionString = targetConnectionString
-                            };
+                            Id = contextId,
+                            MigrationUnitId = mu.Id,
+                            ChunkIndex = i,
+                            State = ProcessState.Pending,
+                            QueuedAt = DateTime.UtcNow,
+                            RetryCount = 0,
+                            SourceConnectionString = sourceConnectionString,
+                            TargetConnectionString = targetConnectionString
+                        };
 
-                            if (_downloadManifest.TryAdd(contextId, context))
-                            {
-                                _log.WriteLine($"{mu.DatabaseName}.{mu.CollectionName}[{i}] added to download manifest", LogType.Debug);
-                                addedCount++;
-                            }
+                        if (TryAddDownloadContext(context))
+                        {
+                            _log.WriteLine($"{mu.DatabaseName}.{mu.CollectionName}[{i}] accepted for download processing", LogType.Debug);
+                            addedCount++;
                         }
                     }
                 }
@@ -749,39 +929,35 @@ namespace OnlineMongoMigrationProcessor
                     if (chunk.IsDownloaded == true && chunk.IsUploaded != true)
                     {
                         string contextId = $"{mu.Id}_{i}";
-
-                        if (!_uploadManifest.ContainsKey(contextId))
+                        var context = new DumpRestoreProcessContext
                         {
-                            var context = new DumpRestoreProcessContext
-                            {
-                                Id = contextId,
-                                MigrationUnitId = mu.Id,
-                                ChunkIndex = i,
-                                State = ProcessState.Pending,
-                                QueuedAt = DateTime.UtcNow,
-                                RetryCount = 0,
-                                SourceConnectionString = sourceConnectionString,
-                                TargetConnectionString = targetConnectionString
-                            };
+                            Id = contextId,
+                            MigrationUnitId = mu.Id,
+                            ChunkIndex = i,
+                            State = ProcessState.Pending,
+                            QueuedAt = DateTime.UtcNow,
+                            RetryCount = 0,
+                            SourceConnectionString = sourceConnectionString,
+                            TargetConnectionString = targetConnectionString
+                        };
 
-                            // Validate dump file exists
-                            if (!ValidateDumpFileExists(context))
-                            {
-                                // Get dump folder and file path                        
-                                string dumpFilePath = GetDumpFilePath(mu, i);
-                                _log.WriteLine($"Dump file missing for restore context {contextId} at {dumpFilePath}. Marking chunk as not downloaded.", LogType.Warning);
-                                mu.MigrationChunks[i].IsDownloaded = false;
-                                mu.DumpComplete = false;
+                        // Validate dump file exists
+                        if (!ValidateDumpFileExists(context))
+                        {
+                            // Get dump folder and file path                        
+                            string dumpFilePath = GetDumpFilePath(mu, i);
+                            _log.WriteLine($"Dump file missing for restore context {contextId} at {dumpFilePath}. Marking chunk as not downloaded.", LogType.Warning);
+                            mu.MigrationChunks[i].IsDownloaded = false;
+                            mu.DumpComplete = false;
 
-                                MigrationJobContext.SaveMigrationUnit(mu, true);
-                                continue;
-                            }
+                            MigrationJobContext.SaveMigrationUnit(mu, true);
+                            continue;
+                        }
 
-                            if (_uploadManifest.TryAdd(contextId, context))
-                            {
-                                _log.WriteLine($"{mu.DatabaseName}.{mu.CollectionName}[{i}] added to restore manifest", LogType.Debug);
-                                addedCount++;
-                            }
+                        if (TryAddUploadContext(context))
+                        {
+                            _log.WriteLine($"{mu.DatabaseName}.{mu.CollectionName}[{i}] accepted for restore processing", LogType.Debug);
+                            addedCount++;
                         }
                     }
                 }
@@ -822,10 +998,6 @@ namespace OnlineMongoMigrationProcessor
                 int availableWorkers = _dumpPool.CurrentAvailable;
                 int totalWorkers = _dumpPool.MaxWorkers;
                 int busyWorkers = totalWorkers - availableWorkers;
-
-                int totalPending = _downloadManifest.Count(kvp => kvp.Value.State == ProcessState.Pending);
-                int totalProcessing = _downloadManifest.Count(kvp => kvp.Value.State == ProcessState.Processing);
-                int totalInManifest = _downloadManifest.Count;
 
 
                 if (availableWorkers <= 0)
@@ -958,10 +1130,6 @@ namespace OnlineMongoMigrationProcessor
                 int availableWorkers = _restorePool.CurrentAvailable;
                 int totalWorkers = _restorePool.MaxWorkers;
                 int busyWorkers = totalWorkers - availableWorkers;
-
-                int totalPending = _uploadManifest.Count(kvp => kvp.Value.State == ProcessState.Pending);
-                int totalProcessing = _uploadManifest.Count(kvp => kvp.Value.State == ProcessState.Processing);
-                int totalInManifest = _uploadManifest.Count;
 
 
                 if (availableWorkers <= 0)
@@ -2333,6 +2501,9 @@ namespace OnlineMongoMigrationProcessor
 
                     _onMigrationUnitCompleted?.Invoke(mu);
                 }
+
+                TryActivatePendingMigrationUnits();
+                RefillManifestWorkingSets();
             }
             catch (Exception ex)
             {
@@ -2362,7 +2533,10 @@ namespace OnlineMongoMigrationProcessor
                 {
                     return _activeMigrationUnits.IsEmpty &&
                            _downloadManifest.IsEmpty &&
-                           _uploadManifest.IsEmpty;
+                           _uploadManifest.IsEmpty &&
+                           _pendingMigrationUnitIndex.IsEmpty &&
+                           _downloadBacklogIndex.IsEmpty &&
+                           _uploadBacklogIndex.IsEmpty;
                 }
             }
             catch (Exception ex)
@@ -2402,6 +2576,12 @@ namespace OnlineMongoMigrationProcessor
                     _downloadManifest.Clear();
                     _uploadManifest.Clear();
                     _activeMigrationUnits.Clear();
+                    _downloadBacklogIndex.Clear();
+                    _uploadBacklogIndex.Clear();
+                    _pendingMigrationUnitIndex.Clear();
+                    ClearQueue(_downloadBacklog);
+                    ClearQueue(_uploadBacklog);
+                    ClearQueue(_pendingMigrationUnits);
                 }
             }
             catch (Exception ex)

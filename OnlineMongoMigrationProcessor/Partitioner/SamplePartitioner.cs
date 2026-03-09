@@ -187,8 +187,10 @@ namespace OnlineMongoMigrationProcessor
                 // Adjust segments per chunk based on the new sample count
                 segmentCount = Math.Max(1, sampleCount / chunkCount);
 
+                bool usePaginationPartitioner = dataType != DataType.ObjectId && config.NonObjectIdPartitioner == PartitionerType.UsePagination;
+
                 // Optimize for non-dump scenarios
-                if (!optimizeForMongoDump)
+                if (!optimizeForMongoDump && !usePaginationPartitioner)
                 {
                     while (chunkCount > segmentCount && segmentCount < GetMaxSegments())
                     {
@@ -224,6 +226,9 @@ namespace OnlineMongoMigrationProcessor
 
                     if (optimizeForObjectId && dataType == DataType.ObjectId && config.ObjectIdPartitioner == PartitionerType.UseSampleCommand)
                         skipDataTypeFilter = true;
+
+                    if (usePaginationPartitioner)
+                        return GetChunkBoundariesGeneralWithPagination(log, collection, dataType, userFilter, skipDataTypeFilter, sampleCount, segmentCount, chunkCount, docCountByType);
 
                     return GetChunkBoundariesGeneral(log, collection, optimizeForMongoDump, dataType, userFilter, skipDataTypeFilter, sampleCount, chunkCount, segmentCount);
                 }
@@ -274,13 +279,6 @@ namespace OnlineMongoMigrationProcessor
                 log.WriteLine($"Chunk Count: {chunkBoundaries.Boundaries.Count} where _id is {dataType}");
 
                 return chunkBoundaries;
-            }
-
-            // Step 1: Build the filter pipeline based on the data type
-            //no need to process user filter in partitioning if it doesn't use _id
-            if (!MongoHelper.UsesIdFieldInFilter(userFilter!))
-            {
-                userFilter = MongoHelper.GetFilterDoc("");
             }
 
             BsonDocument matchCondition = BuildDataTypeCondition(dataType, userFilter, skipDataTypeFilter);
@@ -369,6 +367,132 @@ namespace OnlineMongoMigrationProcessor
             {
                 log.WriteLine($"Total Chunks: {chunkBoundaries.Boundaries.Count} where _id is {dataType}");
             }
+            return chunkBoundaries;
+        }
+
+        private static ChunkBoundaries? GetChunkBoundariesGeneralWithPagination(Log log, IMongoCollection<BsonDocument> collection, DataType dataType, BsonDocument userFilter, bool skipDataTypeFilter, long targetPartitionCount, int segmentCount, int targetChunkCount, long docCountByType)
+        {
+            var rawCollection = collection.Database.GetCollection<RawBsonDocument>(collection.CollectionNamespace.CollectionName);
+
+            Boundary? chunkBoundary = null;
+            targetChunkCount = (int)Math.Max(1, Math.Min((long)targetChunkCount, docCountByType));
+            targetPartitionCount = Math.Max(1, Math.Min(targetPartitionCount, docCountByType));
+            segmentCount = Math.Max(1, segmentCount);
+
+            if (targetChunkCount <= 1 || dataType == DataType.Other)
+            {
+                ChunkBoundaries singleChunkBoundaries = new ChunkBoundaries();
+                chunkBoundary = new Boundary
+                {
+                    StartId = BsonNull.Value,
+                    EndId = BsonNull.Value,
+                    SegmentBoundaries = new List<Boundary>()
+                };
+                singleChunkBoundaries.Boundaries ??= new List<Boundary>();
+                singleChunkBoundaries.Boundaries.Add(chunkBoundary);
+                log.WriteLine($"Chunk Count: {singleChunkBoundaries.Boundaries.Count} where _id is {dataType}");
+                return singleChunkBoundaries;
+            }
+
+            if (!MongoHelper.UsesIdFieldInFilter(userFilter!))
+            {
+                userFilter = MongoHelper.GetFilterDoc("");
+            }
+
+            BsonDocument matchCondition = BuildDataTypeCondition(dataType, userFilter, skipDataTypeFilter);
+            FilterDefinition<RawBsonDocument> baseFilter = (matchCondition != null && matchCondition.ElementCount > 0)
+                ? new BsonDocumentFilterDefinition<RawBsonDocument>(matchCondition)
+                : FilterDefinition<RawBsonDocument>.Empty;
+
+            long recordsPerRange = Math.Max(1, docCountByType / targetPartitionCount);
+            int skipCount = (int)Math.Min(recordsPerRange - 1, int.MaxValue - 1);
+
+            if (skipDataTypeFilter)
+            {
+                log.WriteLine($"Using pagination for {collection.CollectionNamespace} (DataType filtering bypassed), records per range: {recordsPerRange}, target chunk count: {targetChunkCount}, target partition count: {targetPartitionCount}, segment count: {segmentCount}");
+            }
+            else
+            {
+                log.WriteLine($"Using pagination for {collection.CollectionNamespace} where _id is {dataType}, records per range: {recordsPerRange}, target chunk count: {targetChunkCount}, target partition count: {targetPartitionCount}, segment count: {segmentCount}");
+            }
+
+            List<BsonValue> partitionValues = new List<BsonValue>();
+            BsonValue? lastId = null;
+
+            for (long partitionIndex = 0; partitionIndex < targetPartitionCount; partitionIndex++)
+            {
+                try
+                {
+                    FilterDefinition<RawBsonDocument> rangeFilter = baseFilter;
+                    if (lastId != null)
+                    {
+                        rangeFilter = Builders<RawBsonDocument>.Filter.And(
+                            baseFilter,
+                            Builders<RawBsonDocument>.Filter.Gt("_id", lastId));
+                    }
+
+                    var doc = rawCollection
+                        .Find(rangeFilter)
+                        .Sort(Builders<RawBsonDocument>.Sort.Ascending("_id"))
+                        .Project(Builders<RawBsonDocument>.Projection.Include("_id"))
+                        .Skip(skipCount)
+                        .Limit(1)
+                        .FirstOrDefault();
+
+                    if (doc == null || !doc.Contains("_id"))
+                    {
+                        break;
+                    }
+
+                    var currentId = doc["_id"];
+                    if (currentId == BsonNull.Value)
+                    {
+                        break;
+                    }
+
+                    lastId = currentId;
+                    partitionValues.Add(currentId);
+                }
+                catch (Exception ex)
+                {
+                    log.WriteLine($"Encountered error in attempt {partitionIndex} while paginating data where _id is {dataType}: {ex}");
+                }
+            }
+
+            partitionValues = partitionValues
+                .Distinct()
+                .OrderBy(value => value)
+                .ToList();
+
+            if (partitionValues.Count == 0)
+            {
+                if (skipDataTypeFilter)
+                {
+                    log.WriteLine("No data found while generating pagination boundaries (DataType filtering bypassed)");
+                }
+                else
+                {
+                    log.WriteLine($"No data found while generating pagination boundaries where _id is {dataType}");
+                }
+                return null;
+            }
+
+            ChunkBoundaries chunkBoundaries = ConvertToBoundaries(partitionValues, segmentCount);
+
+            if (skipDataTypeFilter)
+            {
+                log.WriteLine($"Total Chunks: {chunkBoundaries.Boundaries.Count} (DataType filtering bypassed) using pagination with segment grouping. Requested chunks: {targetChunkCount}, requested partitions: {targetPartitionCount}, segment count: {segmentCount}");
+            }
+            else
+            {
+                log.WriteLine($"Total Chunks: {chunkBoundaries.Boundaries.Count} where _id is {dataType} using pagination with segment grouping. Requested chunks: {targetChunkCount}, requested partitions: {targetPartitionCount}, segment count: {segmentCount}");
+            }
+
+            if (chunkBoundaries.Boundaries.Count != targetChunkCount)
+            {
+                log.WriteLine($"Pagination created {chunkBoundaries.Boundaries.Count} chunks instead of requested {targetChunkCount}. This can happen when _id boundaries are not unique enough for requested partition count.", LogType.Warning);
+            }
+
             return chunkBoundaries;
         }
 

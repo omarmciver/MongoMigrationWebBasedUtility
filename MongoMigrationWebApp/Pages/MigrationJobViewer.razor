@@ -1073,7 +1073,7 @@ else if (@_showLogBackupFile)
         {
             return;
         }
-        await Downloader(_logBackupFile, $"Backup_{_logBackupFile}");
+        await Downloader(_logBackupFile);
     }
 
 
@@ -1101,7 +1101,7 @@ else if (@_showLogBackupFile)
         else
         {
             // Direct download for small files
-            await Downloader(JobId, JobId);
+            await Downloader(JobId);
         }
     }
 
@@ -1112,45 +1112,24 @@ else if (@_showLogBackupFile)
             return;
         }
 
-        var url = $"/api/File/download/migrationunit/{JobId}/{mu.Id}";
-        var response = await HttpClient.GetAsync(url);
+        var encodedJobId = Uri.EscapeDataString(JobId);
+        var encodedMigrationUnitId = Uri.EscapeDataString(mu.Id);
+        var url = $"/api/File/download/migrationunit/{encodedJobId}/{encodedMigrationUnitId}";
 
-        if (response.IsSuccessStatusCode)
-        {
-            var fileBytes = await response.Content.ReadAsByteArrayAsync();
-            var contentType = response.Content.Headers.ContentType?.ToString() ?? "application/octet-stream";
-            var fileName = $"{mu.DatabaseName}_{mu.CollectionName}_{mu.Id}.json";
-
-            // Use JavaScript to trigger the file download
-            await JS.InvokeVoidAsync("downloadFile", fileBytes, fileName, contentType);
-        }
-        else
-        {
-            await JS.InvokeVoidAsync("open", url, "_blank"); // browser navigates directly
-        }
+        await JS.InvokeVoidAsync("open", url, "_blank");
     }
 
-    private async Task Downloader(string fileName, string displayName)
+    private async Task Downloader(string fileName)
     {
-
-        var url = $"/api/File/download/log/{fileName}";
-
-        var request = new HttpRequestMessage(HttpMethod.Get, url);      
-
-        var response = await HttpClient.GetAsync(url);
-
-        if (response.IsSuccessStatusCode)
+        if (string.IsNullOrWhiteSpace(fileName))
         {
-            var fileBytes = await response.Content.ReadAsByteArrayAsync();
-            var contentType = response.Content.Headers.ContentType?.ToString() ?? "application/octet-stream";
+            return;
+        }
 
-            // Use JavaScript to trigger the file download
-            await JS.InvokeVoidAsync("downloadFile", fileBytes, $"{displayName}.json", contentType);
-        }
-        else
-        {
-            await JS.InvokeVoidAsync("open", url, "_blank"); // browser navigates directly
-        }
+        var encodedFileName = Uri.EscapeDataString(fileName);
+        var url = $"/api/File/download/log/{encodedFileName}";
+
+        await JS.InvokeVoidAsync("open", url, "_blank");
     }
 
     private async Task<int> GetLogCount(string jobId)

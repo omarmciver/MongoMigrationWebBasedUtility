@@ -2,6 +2,15 @@
 # Deploys the MongoDB Migration Web-Based Utility to Azure Container Apps
 # using JFrog Artifactory as the container registry
 #
+# USAGE:
+#   Full deployment (first time or infrastructure changes):
+#     .\deploy-to-aca-jfrog.ps1 -ResourceGroupName rg -ContainerAppName app ...
+#
+#   Image update only (new revision, no infrastructure changes):
+#     .\deploy-to-aca-jfrog.ps1 -UpdateOnly -ResourceGroupName rg -ContainerAppName app `
+#       -JFrogRegistryServer jfrog.io -JFrogUsername user -JFrogRepository repo `
+#       [-ImageTag v2] [-SkipDockerBuild]
+#
 # PREREQUISITES:
 #   - Docker Desktop or Docker CLI installed and running
 #   - Azure CLI installed and logged in
@@ -47,23 +56,23 @@ param(
     [Parameter(Mandatory=$false)]
     [string]$JFrogBaseImageRepository = "",
     
-    [Parameter(Mandatory=$true)]
-    [string]$JFrogDebianRepo,
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogDebianRepo = "",
     
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory=$false)]
     [string]$JFrogDebianDistribution = "bookworm",
     
-    [Parameter(Mandatory=$true)]
-    [string]$JFrogDebianComponent,
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogDebianComponent = "",
     
-    [Parameter(Mandatory=$true)]
-    [string]$JFrogNuGetRepo,
+    [Parameter(Mandatory=$false)]
+    [string]$JFrogNuGetRepo = "",
     
     [Parameter(Mandatory=$false)]
     [string]$StateStoreAppID = "",
     
-    [Parameter(Mandatory=$true)]
-    [string]$Location,
+    [Parameter(Mandatory=$false)]
+    [string]$Location = "",
     
     [Parameter(Mandatory=$false)]
     [string]$StorageAccountName = "",
@@ -88,8 +97,8 @@ param(
     [Parameter(Mandatory=$false)]
     [switch]$UseEntraIdForAzureStorage,
 
-    [Parameter(Mandatory=$true)]
-    [string]$OwnerTag,
+    [Parameter(Mandatory=$false)]
+    [string]$OwnerTag = "",
     
     [Parameter(Mandatory=$false)]
     [string]$JFrogPassword = "",
@@ -101,10 +110,32 @@ param(
     [switch]$SkipDockerBuild,
     
     [Parameter(Mandatory=$false)]
-    [string]$JFrogRegistryServerForACA = ""
+    [string]$JFrogRegistryServerForACA = "",
+
+    [Parameter(Mandatory=$false)]
+    [switch]$UpdateOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+# =============================================================================
+# Validate parameters based on mode
+# =============================================================================
+if (-not $UpdateOnly) {
+    # Full deployment requires these parameters
+    $missingParams = @()
+    if ([string]::IsNullOrEmpty($Location))            { $missingParams += "Location" }
+    if ([string]::IsNullOrEmpty($OwnerTag))             { $missingParams += "OwnerTag" }
+    if ([string]::IsNullOrEmpty($JFrogDebianRepo))      { $missingParams += "JFrogDebianRepo" }
+    if ([string]::IsNullOrEmpty($JFrogDebianComponent)) { $missingParams += "JFrogDebianComponent" }
+    if ([string]::IsNullOrEmpty($JFrogNuGetRepo))       { $missingParams += "JFrogNuGetRepo" }
+    
+    if ($missingParams.Count -gt 0) {
+        Write-Host "Error: The following parameters are required for full deployment: $($missingParams -join ', ')" -ForegroundColor Red
+        Write-Host "Use -UpdateOnly to skip infrastructure deployment and only update the container image." -ForegroundColor Yellow
+        exit 1
+    }
+}
 
 # Use the same registry for base images if not specified
 if ([string]::IsNullOrEmpty($JFrogBaseImageRegistry)) {
@@ -147,15 +178,23 @@ $FullImageWithTag = "${FullImagePath}:${ImageTag}"
 $FullImagePathForACA = "$JFrogRegistryServerForACA/$JFrogRepository/$ImageName"
 $FullImageWithTagForACA = "${FullImagePathForACA}:${ImageTag}"
 
-Write-Host "`n=== Azure Container Apps Deployment (JFrog Registry) ===" -ForegroundColor Cyan
+if ($UpdateOnly) {
+    Write-Host "`n=== Azure Container Apps Image Update (JFrog Registry) ===" -ForegroundColor Cyan
+    Write-Host "Mode: UPDATE ONLY (new revision, no infrastructure changes)" -ForegroundColor Yellow
+} else {
+    Write-Host "`n=== Azure Container Apps Deployment (JFrog Registry) ===" -ForegroundColor Cyan
+    Write-Host "Mode: FULL DEPLOYMENT (infrastructure + container app)" -ForegroundColor Yellow
+}
 Write-Host "Resource Group: $ResourceGroupName" -ForegroundColor White
 Write-Host "Container App: $ContainerAppName" -ForegroundColor White
 Write-Host "JFrog Registry: $JFrogRegistryServer" -ForegroundColor White
 Write-Host "JFrog Repository: $JFrogRepository" -ForegroundColor White
-Write-Host "Base Image Registry: $JFrogBaseImageRegistry" -ForegroundColor White
+if (-not $UpdateOnly) {
+    Write-Host "Base Image Registry: $JFrogBaseImageRegistry" -ForegroundColor White
+    Write-Host "Location: $Location" -ForegroundColor White
+}
 Write-Host "Image: $FullImageWithTag" -ForegroundColor White
-Write-Host "Location: $Location" -ForegroundColor White
-if ($UseEntraIdForAzureStorage) {
+if ($UseEntraIdForAzureStorage -and -not $UpdateOnly) {
     Write-Host "Using Entra ID (Managed Identity) for Azure Storage instead of mounted disk" -ForegroundColor Cyan
 }
 Write-Host ""
@@ -253,95 +292,126 @@ if (-not $SkipDockerBuild) {
     Write-Host "Assuming image already exists at: $FullImageWithTag" -ForegroundColor Gray
 }
 
-Write-Host "`nStep 2: Deploying infrastructure (Storage Account, Managed Identity, Container Apps Environment)..." -ForegroundColor Yellow
-Write-Host "Note: This may take 3-5 minutes..." -ForegroundColor Gray
-
-$bicepParams = @(
-    "deployment", "group", "create",
-    "--resource-group", $ResourceGroupName,
-    "--template-file", "aca_main_jfrog.bicep",
-    "--parameters",
-        "containerAppName=$ContainerAppName",
-        "jfrogRegistryServer=$JFrogRegistryServerForACA",
-        "jfrogUsername=$JFrogUsername",
-        "jfrogPassword=`"$jfrogPassword`"",
-        "jfrogImageRepository=$FullImagePathForACA",
-        "location=$Location",
-        "storageAccountName=$StorageAccountName",
-        "vCores=$VCores",
-        "memoryGB=$MemoryGB",
-        "ownerTag=$OwnerTag",
-        "useEntraIdForStorage=$($UseEntraIdForAzureStorage.ToString().ToLower())"
-)
-
-# Add VNet configuration if provided
-if (-not [string]::IsNullOrEmpty($InfrastructureSubnetResourceId)) {
-    Write-Host "VNet integration enabled with subnet: $InfrastructureSubnetResourceId" -ForegroundColor Cyan
-    $bicepParams += "infrastructureSubnetResourceId=$InfrastructureSubnetResourceId"
-}
-
-Write-Host "Running: az deployment group create..." -ForegroundColor Gray
-az @bicepParams
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "`nError: Infrastructure deployment failed" -ForegroundColor Red
+if ($UpdateOnly) {
+    # ==========================================================================
+    # UPDATE-ONLY MODE: Skip infrastructure, just update the container image
+    # This creates a new revision without redeploying storage, identity, or env
+    # ==========================================================================
+    Write-Host "`nStep 2: Updating container image (UpdateOnly mode)..." -ForegroundColor Yellow
+    Write-Host "Skipping infrastructure deployment -- only creating a new revision." -ForegroundColor Cyan
+    Write-Host "New image: $FullImageWithTagForACA" -ForegroundColor White
+    
+    $ErrorActionPreference = 'Continue'
+    az containerapp update `
+        --name $ContainerAppName `
+        --resource-group $ResourceGroupName `
+        --image $FullImageWithTagForACA
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`nError: Container image update failed" -ForegroundColor Red
+        Remove-Variable jfrogPassword, secureJFrogPassword -ErrorAction Ignore
+        exit 1
+    }
+    $ErrorActionPreference = 'Stop'
+    
+    Write-Host "Container image updated successfully. New revision created." -ForegroundColor Green
     Remove-Variable jfrogPassword, secureJFrogPassword -ErrorAction Ignore
-    exit 1
-}
-
-Write-Host "Infrastructure deployment completed successfully" -ForegroundColor Green
-
-Write-Host "`nStep 3: StateStore connection string..." -ForegroundColor Yellow
-if ([string]::IsNullOrEmpty($StateStoreConnectionString)) {
-    $secureConnString = Read-Host -Prompt "The StateStore keeps track of migration job details in a DocumentDB. You may use the same database as the Target DocumentDB or a separate one. Enter the connection string for the StateStore." -AsSecureString
-    $connString = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-        [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureConnString)
-    )
+    
+    Write-Host "`n=== Update Complete ===" -ForegroundColor Cyan
 } else {
-    $connString = $StateStoreConnectionString
-    Write-Host "Using StateStore connection string from parameter" -ForegroundColor Gray
-}
-
-Write-Host "`nStep 4: Deploying Container App with application image..." -ForegroundColor Yellow
-
-$finalBicepParams = @(
-    "deployment", "group", "create",
-    "--resource-group", $ResourceGroupName,
-    "--template-file", "aca_main_jfrog.bicep",
-    "--parameters",
-        "containerAppName=$ContainerAppName",
-        "jfrogRegistryServer=$JFrogRegistryServerForACA",
-        "jfrogUsername=$JFrogUsername",
-        "jfrogPassword=`"$jfrogPassword`"",
-        "jfrogImageRepository=$FullImagePathForACA",
-        "location=$Location",
-        "storageAccountName=$StorageAccountName",
-        "vCores=$VCores",
-        "memoryGB=$MemoryGB",
-        "stateStoreAppID=$StateStoreAppID",
-        "stateStoreConnectionString=`"$connString`"",
-        "aspNetCoreEnvironment=Development",
-        "imageTag=$ImageTag",
-        "ownerTag=$OwnerTag",
-        "useEntraIdForStorage=$($UseEntraIdForAzureStorage.ToString().ToLower())"
-)
-
-# Add VNet configuration if provided
-if (-not [string]::IsNullOrEmpty($InfrastructureSubnetResourceId)) {
-    $finalBicepParams += "infrastructureSubnetResourceId=$InfrastructureSubnetResourceId"
-}
-
-az @finalBicepParams
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "`nError: Container App deployment failed" -ForegroundColor Red
+    # ==========================================================================
+    # FULL DEPLOYMENT MODE: Deploy all infrastructure + container app
+    # ==========================================================================
+    Write-Host "`nStep 2: Deploying infrastructure (Storage Account, Managed Identity, Container Apps Environment)..." -ForegroundColor Yellow
+    Write-Host "Note: This may take 3-5 minutes..." -ForegroundColor Gray
+    
+    $bicepParams = @(
+        "deployment", "group", "create",
+        "--resource-group", $ResourceGroupName,
+        "--template-file", "aca_main_jfrog.bicep",
+        "--parameters",
+            "containerAppName=$ContainerAppName",
+            "jfrogRegistryServer=$JFrogRegistryServerForACA",
+            "jfrogUsername=$JFrogUsername",
+            "jfrogPassword=`"$jfrogPassword`"",
+            "jfrogImageRepository=$FullImagePathForACA",
+            "location=$Location",
+            "storageAccountName=$StorageAccountName",
+            "vCores=$VCores",
+            "memoryGB=$MemoryGB",
+            "ownerTag=$OwnerTag",
+            "useEntraIdForStorage=$($UseEntraIdForAzureStorage.ToString().ToLower())"
+    )
+    
+    # Add VNet configuration if provided
+    if (-not [string]::IsNullOrEmpty($InfrastructureSubnetResourceId)) {
+        Write-Host "VNet integration enabled with subnet: $InfrastructureSubnetResourceId" -ForegroundColor Cyan
+        $bicepParams += "infrastructureSubnetResourceId=$InfrastructureSubnetResourceId"
+    }
+    
+    Write-Host "Running: az deployment group create..." -ForegroundColor Gray
+    az @bicepParams
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`nError: Infrastructure deployment failed" -ForegroundColor Red
+        Remove-Variable jfrogPassword, secureJFrogPassword -ErrorAction Ignore
+        exit 1
+    }
+    
+    Write-Host "Infrastructure deployment completed successfully" -ForegroundColor Green
+    
+    Write-Host "`nStep 3: StateStore connection string..." -ForegroundColor Yellow
+    if ([string]::IsNullOrEmpty($StateStoreConnectionString)) {
+        $secureConnString = Read-Host -Prompt "The StateStore keeps track of migration job details in a DocumentDB. You may use the same database as the Target DocumentDB or a separate one. Enter the connection string for the StateStore." -AsSecureString
+        $connString = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureConnString)
+        )
+    } else {
+        $connString = $StateStoreConnectionString
+        Write-Host "Using StateStore connection string from parameter" -ForegroundColor Gray
+    }
+    
+    Write-Host "`nStep 4: Deploying Container App with application image..." -ForegroundColor Yellow
+    
+    $finalBicepParams = @(
+        "deployment", "group", "create",
+        "--resource-group", $ResourceGroupName,
+        "--template-file", "aca_main_jfrog.bicep",
+        "--parameters",
+            "containerAppName=$ContainerAppName",
+            "jfrogRegistryServer=$JFrogRegistryServerForACA",
+            "jfrogUsername=$JFrogUsername",
+            "jfrogPassword=`"$jfrogPassword`"",
+            "jfrogImageRepository=$FullImagePathForACA",
+            "location=$Location",
+            "storageAccountName=$StorageAccountName",
+            "vCores=$VCores",
+            "memoryGB=$MemoryGB",
+            "stateStoreAppID=$StateStoreAppID",
+            "stateStoreConnectionString=`"$connString`"",
+            "aspNetCoreEnvironment=Development",
+            "imageTag=$ImageTag",
+            "ownerTag=$OwnerTag",
+            "useEntraIdForStorage=$($UseEntraIdForAzureStorage.ToString().ToLower())"
+    )
+    
+    # Add VNet configuration if provided
+    if (-not [string]::IsNullOrEmpty($InfrastructureSubnetResourceId)) {
+        $finalBicepParams += "infrastructureSubnetResourceId=$InfrastructureSubnetResourceId"
+    }
+    
+    az @finalBicepParams
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`nError: Container App deployment failed" -ForegroundColor Red
+        Remove-Variable connString, secureConnString, jfrogPassword, secureJFrogPassword -ErrorAction Ignore
+        exit 1
+    }
+    
     Remove-Variable connString, secureConnString, jfrogPassword, secureJFrogPassword -ErrorAction Ignore
-    exit 1
+    
+    Write-Host "`n=== Deployment Complete ===" -ForegroundColor Cyan
 }
-
-Remove-Variable connString, secureConnString, jfrogPassword, secureJFrogPassword -ErrorAction Ignore
-
-Write-Host "`n=== Deployment Complete ===" -ForegroundColor Cyan
 
 # Deactivate old revisions to free up resources
 Write-Host "`nCleaning up old revisions..." -ForegroundColor Yellow
@@ -403,8 +473,8 @@ if ($scaleConfig.minReplicas) {
 
 Write-Host "Expected replica count: $expectedReplicaCount (minReplicas: $($scaleConfig.minReplicas), maxReplicas: $($scaleConfig.maxReplicas))" -ForegroundColor Cyan
 
-# Get the deployed image name
-$imageName = $FullImageWithTag
+# Get the deployed image name (use ACA image path since that's what the revision reports)
+$imageName = $FullImageWithTagForACA
 
 # Wait for the new container to become ready
 Write-Host "`nWaiting for container to become active and healthy..." -ForegroundColor Yellow

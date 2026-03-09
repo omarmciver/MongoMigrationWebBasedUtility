@@ -89,7 +89,9 @@ RUN dotnet publish "./MongoMigrationWebApp.csproj" -c $BUILD_CONFIGURATION -o /a
 FROM base AS final
 
 # MongoDB tools download URLs - can be overridden at build time
-# NOTE: Base image is Debian 12 (bookworm), so use debian12 tools
+# NOTE: These glibc-linked binaries work on Debian, Ubuntu, and Azure Linux.
+#       They do NOT work on Alpine (musl libc). If the base image is Alpine,
+#       the build will fail with a clear error message.
 ARG MongoDumpURL="https://fastdl.mongodb.org/tools/db/mongodb-database-tools-debian12-x86_64-100.13.0.tgz"
 ARG MongoRestoreURL="https://fastdl.mongodb.org/tools/db/mongodb-database-tools-debian12-x86_64-100.13.0.tgz"
 ENV MongoDumpURL=${MongoDumpURL}
@@ -104,6 +106,11 @@ USER root
 # MongoDB Database Tools are downloaded directly from MongoDB's CDN.
 # The URLs are defined as ARGs above and can be overridden at build time.
 #
+# PACKAGE MANAGER DETECTION:
+# The base aspnet:9.0 image OS varies depending on the registry/proxy config.
+# MCR serves Debian 12 for :9.0, but JFrog group repos may resolve differently.
+# This script auto-detects: apt-get (Debian/Ubuntu), tdnf (Azure Linux), apk (Alpine).
+#
 # TODO: Once JFrog team approves https://repo.mongodb.org/apt/debian as a remote
 # proxy, switch to apt-get install instead:
 # ARG JFROG_DEBIAN_URL
@@ -113,16 +120,35 @@ USER root
 # RUN apt-get update && apt-get install -y mongodb-database-tools && apt-get clean && rm -rf /var/lib/apt/lists/*
 # =============================================================================
 
+# Step 1: Install prerequisites (OS-agnostic)
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y wget gnupg ca-certificates tar gzip \
-        libcurl4 \
-        libgssapi-krb5-2 \
-        libkrb5-3 \
-        libsasl2-2 \
-        libssl3 \
-        libldap-2.5-0 \
-        zlib1g; \
+    if command -v apt-get >/dev/null 2>&1; then \
+        echo ">>> Detected Debian/Ubuntu (apt-get)"; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
+            wget ca-certificates tar gzip \
+            libcurl4 libgssapi-krb5-2 libkrb5-3 \
+            libsasl2-2 libssl3 libldap-2.5-0 zlib1g; \
+        apt-get clean; rm -rf /var/lib/apt/lists/*; \
+    elif command -v tdnf >/dev/null 2>&1; then \
+        echo ">>> Detected Azure Linux (tdnf)"; \
+        tdnf install -y \
+            wget ca-certificates tar gzip \
+            libcurl krb5-libs cyrus-sasl openssl-libs openldap zlib; \
+        tdnf clean all; \
+    elif command -v apk >/dev/null 2>&1; then \
+        echo ">>> Detected Alpine (apk) — installing gcompat for glibc compatibility"; \
+        apk add --no-cache \
+            wget ca-certificates tar gzip \
+            libcurl krb5-libs cyrus-sasl-lib libldap zlib \
+            gcompat; \
+    else \
+        echo "ERROR: No supported package manager found (need apt-get, tdnf, or apk)" >&2; \
+        exit 1; \
+    fi
+
+# Step 2: Download and install MongoDB tools
+RUN set -eux; \
     mkdir -p /opt/mongo-tools/dump /opt/mongo-tools/restore; \
     wget --no-check-certificate -O /tmp/mongodump-tools.tgz "$MongoDumpURL"; \
     wget --no-check-certificate -O /tmp/mongorestore-tools.tgz "$MongoRestoreURL"; \
@@ -139,8 +165,7 @@ RUN set -eux; \
     command -v mongorestore; \
     mongodump --version; \
     mongorestore --version; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/* /tmp/mongodump-tools.tgz /tmp/mongorestore-tools.tgz
+    rm -rf /tmp/mongodump-tools.tgz /tmp/mongorestore-tools.tgz
 
 # Create the migration data directory structure that the app expects
 # The app looks for ResourceDrive/home/ directory structure

@@ -5,6 +5,8 @@ from collection_config import CollectionConfig
 from console_utils import Colors, print_warning, print_error, print_success
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class SchemaMigration:
     """
@@ -41,34 +43,73 @@ class SchemaMigration:
 
     # Index option combinations that conflict
     CONFLICTING_INDEX_OPTION_PAIRS = [('sparse', 'partialFilterExpression')]
+    
+    # Default parallelization settings
+    DEFAULT_MAX_WORKERS = 32
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, max_workers: int = DEFAULT_MAX_WORKERS):
         """
         Initialize the SchemaMigration class.
 
         :param verbose: Enable verbose output for detailed flow logging.
+        :param max_workers: Maximum number of parallel workers for collection processing.
         """
         self.verbose = verbose
+        self.max_workers = max_workers
         self.incompatible_indexes = []  # Track indexes with unsupported partialFilterExpression
         self.skipped_index_options = []  # Track indexes with unsupported options (collation, hidden, etc.)
         self.structural_incompatibilities = []  # Track structural issues (text dup, 2dsphere compound, etc.)
+        self.failed_collections = []  # Track collections that failed during migration
+        
+        # Thread synchronization primitives
+        self._lock = threading.Lock()
+        self._print_lock = threading.Lock()
 
     def _print_verbose(self, message: str) -> None:
-        """Print a message if verbose mode is enabled."""
+        """Print a message if verbose mode is enabled (thread-safe)."""
         if self.verbose:
-            print(message)
+            with self._print_lock:
+                print(message)
 
     def _print_warning(self, message: str) -> None:
-        """Print a warning message in yellow."""
-        print_warning(message)
+        """Print a warning message in yellow (thread-safe)."""
+        with self._print_lock:
+            print_warning(message)
 
     def _print_error(self, message: str) -> None:
-        """Print an error message in red."""
-        print_error(message)
+        """Print an error message in red (thread-safe)."""
+        with self._print_lock:
+            print_error(message)
 
     def _print_success(self, message: str) -> None:
-        """Print a success/milestone message in green."""
-        print_success(message)
+        """Print a success/milestone message in green (thread-safe)."""
+        with self._print_lock:
+            print_success(message)
+    
+    def _print_info(self, message: str) -> None:
+        """Print an info message (thread-safe)."""
+        with self._print_lock:
+            print(message)
+    
+    def _append_incompatible_index(self, entry: Dict[str, Any]) -> None:
+        """Thread-safe append to incompatible_indexes list."""
+        with self._lock:
+            self.incompatible_indexes.append(entry)
+    
+    def _append_skipped_index_option(self, entry: Dict[str, Any]) -> None:
+        """Thread-safe append to skipped_index_options list."""
+        with self._lock:
+            self.skipped_index_options.append(entry)
+    
+    def _append_structural_incompatibility(self, entry: Dict[str, Any]) -> None:
+        """Thread-safe append to structural_incompatibilities list."""
+        with self._lock:
+            self.structural_incompatibilities.append(entry)
+    
+    def _append_failed_collection(self, entry: Dict[str, Any]) -> None:
+        """Thread-safe append to failed_collections list."""
+        with self._lock:
+            self.failed_collections.append(entry)
 
     def _validate_connections(
             self,
@@ -138,28 +179,110 @@ class SchemaMigration:
         self.incompatible_indexes = []  # Reset incompatible indexes list for each migration run
         self.skipped_index_options = []  # Reset skipped options list for each migration run
         self.structural_incompatibilities = []  # Reset structural incompatibilities
+        self.failed_collections = []  # Reset failed collections list
         
-        for collection_index, collection_config in enumerate(collection_configs):
-            db_name = collection_config.db_name
-            collection_name = collection_config.collection_name
-
-            print(f"\nMigrating schema for collection: {db_name}.{collection_name}")
+        total_collections = len(collection_configs)
+        
+        # Use parallel processing if we have multiple collections and more than 1 worker
+        if total_collections > 1 and self.max_workers > 1:
+            effective_workers = min(self.max_workers, total_collections)
+            self._print_info(f"\nProcessing {total_collections} collections with {effective_workers} parallel workers...")
+            self._print_verbose(f"Using ThreadPoolExecutor with {effective_workers} workers")
             
-            self._print_verbose(f"Processing collection {collection_index + 1}/{len(collection_configs)}")
+            completed_count = 0
+            completed_lock = threading.Lock()
+            
+            def process_with_progress(args):
+                nonlocal completed_count
+                collection_index, collection_config = args
+                result = self._migrate_single_collection(
+                    source_client, dest_client, collection_config,
+                    collection_index, total_collections,
+                    shardkey_export_path, shardkey_import_path
+                )
+                with completed_lock:
+                    completed_count += 1
+                    if completed_count % 100 == 0 or completed_count == total_collections:
+                        self._print_info(f"Progress: {completed_count}/{total_collections} collections processed")
+                return result
+            
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                futures = [
+                    executor.submit(process_with_progress, (idx, config))
+                    for idx, config in enumerate(collection_configs)
+                ]
+                
+                # Wait for all futures to complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()  # Raises exception if the worker raised one
+                    except Exception as e:
+                        # This shouldn't happen as _migrate_single_collection catches exceptions
+                        self._print_error(f"Unexpected error in worker: {e}")
+        else:
+            # Sequential processing for single collection or single worker
+            self._print_verbose(f"Processing collections sequentially")
+            for collection_index, collection_config in enumerate(collection_configs):
+                self._migrate_single_collection(
+                    source_client, dest_client, collection_config,
+                    collection_index, total_collections,
+                    shardkey_export_path, shardkey_import_path
+                )
+        
+        # Report all incompatible indexes at the end
+        self._report_incompatible_indexes()
+        self._report_skipped_index_options()
+        self._report_structural_incompatibilities()
+        self._report_failed_collections()
+        
+        self._print_verbose(f"Migration completed for all {len(collection_configs)} collection(s)")
+    
+    def _migrate_single_collection(
+            self,
+            source_client: MongoClient,
+            dest_client: MongoClient,
+            collection_config: CollectionConfig,
+            collection_index: int,
+            total_collections: int,
+            shardkey_export_path: Optional[str],
+            shardkey_import_path: Optional[str]) -> bool:
+        """
+        Migrate a single collection's schema (indexes, shard key, etc.).
+        
+        This method is designed to be called from a thread pool for parallel processing.
+        All state modifications use thread-safe methods.
+        
+        :param source_client: MongoDB client connected to the source database.
+        :param dest_client: MongoDB client connected to the destination database.
+        :param collection_config: Configuration for the collection to migrate.
+        :param collection_index: Index of this collection in the overall list.
+        :param total_collections: Total number of collections being migrated.
+        :param shardkey_export_path: Path to export shard key info (optional).
+        :param shardkey_import_path: Path to import shard key info (optional).
+        :return: True if migration succeeded, False otherwise.
+        """
+        db_name = collection_config.db_name
+        collection_name = collection_config.collection_name
+        collection_ns = f"{db_name}.{collection_name}"
+        
+        try:
+            self._print_info(f"\nMigrating schema for collection: {collection_ns}")
+            
+            self._print_verbose(f"Processing collection {collection_index + 1}/{total_collections}")
             self._print_verbose(f"  Database: {db_name}")
             self._print_verbose(f"  Collection: {collection_name}")
 
             # ── Rule: Skip system collections ──
             if collection_name.startswith('system.'):
                 self._print_warning(f"-- [SKIPPED] System collection '{collection_name}' cannot be migrated")
-                continue
+                return True
 
             source_db = source_client[db_name]
             
             # ── Rule: Skip views (they don't have their own indexes) ──
             if self._is_view(source_db, collection_name):
                 self._print_warning(f"-- [SKIPPED] '{collection_name}' is a view, not a collection")
-                continue
+                return True
             
             source_collection = source_db[collection_name]
 
@@ -173,7 +296,7 @@ class SchemaMigration:
 
             # Check if the destination collection should be dropped
             if collection_config.drop_if_exists:
-                print("-- Running drop command on target collection")
+                self._print_info("-- Running drop command on target collection")
                 self._print_verbose(f"Dropping existing collection {db_name}.{dest_collection_name} on destination")
                 dest_collection.drop()
                 self._print_verbose(f"Collection dropped successfully")
@@ -182,17 +305,17 @@ class SchemaMigration:
 
             # Create the destination collection if it doesn't exist
             if dest_collection_name not in dest_db.list_collection_names():
-                print("-- Creating target collection")
+                self._print_info("-- Creating target collection")
                 self._print_verbose(f"Collection does not exist on destination, creating new collection")
                 dest_db.create_collection(dest_collection_name)
                 self._print_verbose(f"Collection created successfully")
             else:
-                print("-- Target collection already exists. Skipping creation.")
+                self._print_info("-- Target collection already exists. Skipping creation.")
                 self._print_verbose(f"Collection already exists, skipping creation step")
 
             # Handle colocation if specified
             if collection_config.co_locate_with:
-                print(f"-- Setting up colocation with collection: {collection_config.co_locate_with}")
+                self._print_info(f"-- Setting up colocation with collection: {collection_config.co_locate_with}")
                 self._print_verbose(f"Colocation requested with reference collection: {collection_config.co_locate_with}")
                 self._setup_colocation(dest_db, dest_collection_name, collection_config.co_locate_with)
                 self._verify_colocation(dest_client, db_name, dest_collection_name, collection_config.co_locate_with)
@@ -227,7 +350,7 @@ class SchemaMigration:
                             # Convert shard key to use hashed value since the destination
                             # only supports hashed shard keys
                             hashed_shard_key = {k: "hashed" for k in source_shard_key}
-                        print(f"-- Migrating shard key - {source_shard_key} as hashed: {hashed_shard_key}.")
+                        self._print_info(f"-- Migrating shard key - {source_shard_key} as hashed: {hashed_shard_key}.")
                         self._print_verbose(f"Found shard key on source: {source_shard_key}")
                         self._print_verbose(f"Converted to hashed shard key: {hashed_shard_key}")
                         self._print_verbose(f"Running shardCollection command on destination")
@@ -243,193 +366,218 @@ class SchemaMigration:
                     # Permission error already reported in _get_shard_key, continue with migration
                     self._print_verbose(f"Skipping shard key migration due to permission error")
             else:
-                print("-- Skipping shard key migration for collection")
+                self._print_info("-- Skipping shard key migration for collection")
                 self._print_verbose(f"migrate_shard_key=False, skipping shard key migration")
 
             # Migrate indexes
-            self._print_verbose(f"Reading indexes from source collection")
-            index_list = []
-            source_indexes = source_collection.index_information()
-            self._print_verbose(f"Found {len(source_indexes)} index(es) on source collection")
+            self._migrate_indexes_for_collection(
+                source_collection, dest_collection, collection_config,
+                db_name, dest_collection_name
+            )
             
-            for source_index_name, source_index_info in source_indexes.items():
-                # ── Rule: Skip _id_ index (auto-created by DocumentDB) ──
-                if source_index_name == '_id_':
-                    self._print_verbose(f"  Skipping default _id_ index (auto-created on destination)")
-                    continue
-                    
-                self._print_verbose(f"  Processing index: {source_index_name}")
-                index_keys = source_index_info['key']
+            return True
+            
+        except Exception as e:
+            self._print_error(f"-- [FAILED] Collection '{collection_ns}' migration failed: {e}")
+            self._append_failed_collection({
+                'collection': collection_ns,
+                'error': str(e)
+            })
+            return False
+    
+    def _migrate_indexes_for_collection(
+            self,
+            source_collection,
+            dest_collection,
+            collection_config: CollectionConfig,
+            db_name: str,
+            dest_collection_name: str) -> None:
+        """
+        Migrate indexes for a single collection.
+        
+        :param source_collection: The source MongoDB collection object.
+        :param dest_collection: The destination MongoDB collection object.
+        :param collection_config: Configuration for the collection.
+        :param db_name: The database name.
+        :param dest_collection_name: The destination collection name.
+        """
+        self._print_verbose(f"Reading indexes from source collection")
+        index_list = []
+        source_indexes = source_collection.index_information()
+        self._print_verbose(f"Found {len(source_indexes)} index(es) on source collection")
+        
+        for source_index_name, source_index_info in source_indexes.items():
+            # ── Rule: Skip _id_ index (auto-created by DocumentDB) ──
+            if source_index_name == '_id_':
+                self._print_verbose(f"  Skipping default _id_ index (auto-created on destination)")
+                continue
                 
-                # ── Rule: Normalize float directions to int (1.0 -> 1, -1.0 -> -1) ──
-                index_keys = self._normalize_index_keys(index_keys)
-                
-                index_options = {k: v for k, v in source_index_info.items() if k not in ['key', 'v']}
-                index_options['name'] = source_index_name
-                index_list.append((index_keys, index_options))
-                self._print_verbose(f"    Keys: {index_keys}")
-                self._print_verbose(f"    Options: {index_options}")
+            self._print_verbose(f"  Processing index: {source_index_name}")
+            index_keys = source_index_info['key']
+            
+            # ── Rule: Normalize float directions to int (1.0 -> 1, -1.0 -> -1) ──
+            index_keys = self._normalize_index_keys(index_keys)
+            
+            index_options = {k: v for k, v in source_index_info.items() if k not in ['key', 'v']}
+            index_options['name'] = source_index_name
+            index_list.append((index_keys, index_options))
+            self._print_verbose(f"    Keys: {index_keys}")
+            self._print_verbose(f"    Options: {index_options}")
 
-            if collection_config.optimize_compound_indexes:
-                print("-- Optimizing compound indexes if available")
-                self._print_verbose(f"optimize_compound_indexes=True, analyzing compound indexes")
-                self._print_verbose(f"Index count before optimization: {len(index_list)}")
-                index_list = self._optimize_compound_indexes(index_list)
-                self._print_verbose(f"Index count after optimization: {len(index_list)}")
-            else:
-                self._print_verbose(f"optimize_compound_indexes=False, using all indexes as-is")
+        if collection_config.optimize_compound_indexes:
+            self._print_info("-- Optimizing compound indexes if available")
+            self._print_verbose(f"optimize_compound_indexes=True, analyzing compound indexes")
+            self._print_verbose(f"Index count before optimization: {len(index_list)}")
+            index_list = self._optimize_compound_indexes(index_list)
+            self._print_verbose(f"Index count after optimization: {len(index_list)}")
+        else:
+            self._print_verbose(f"optimize_compound_indexes=False, using all indexes as-is")
 
-            print("-- Migrating indexes for collection")
-            self._print_verbose(f"Creating {len(index_list)} index(es) on destination")
-            created_index_names = set()  # Track created index names to detect conflicts
-            created_index_keys = set()  # Track created index key signatures to detect duplicates
-            has_text_index = False  # Only one text index allowed per collection
-            for index_keys, index_options in index_list:
-                index_name = index_options.get('name', 'unnamed')
-                collection_ns = f"{db_name}.{dest_collection_name}"
-                
-                # ── Rule: Filter out unsupported index options (collation, hidden, etc.) ──
-                skip_index = False
-                for unsupported_opt in self.UNSUPPORTED_INDEX_OPTIONS:
-                    if unsupported_opt in index_options:
-                        self._print_warning(f"---- [SKIPPED] Index '{index_name}': '{unsupported_opt}' option is not supported on destination")
-                        self._print_verbose(f"  Removing unsupported option '{unsupported_opt}' from index '{index_name}'")
-                        self.skipped_index_options.append({
-                            'collection': collection_ns,
-                            'index_name': index_name,
-                            'option': unsupported_opt,
-                            'value': index_options[unsupported_opt]
-                        })
-                        skip_index = True
-                if skip_index:
-                    continue
-                
-                # ── Rule: Only one text index allowed per collection (#1, #2, #42) ──
-                is_text_index = any(direction == 'text' for _, direction in index_keys)
-                if is_text_index:
-                    if has_text_index:
-                        self._print_warning(f"---- [SKIPPED] Index '{index_name}': Only one text index is allowed per collection")
-                        self.structural_incompatibilities.append({
-                            'collection': collection_ns,
-                            'index_name': index_name,
-                            'reason': 'Only one text index is allowed per collection. A text index already exists.'
-                        })
-                        continue
-                    has_text_index = True
-                    # ── Rule: Downgrade textIndexVersion if needed (DocumentDB supports v1/v2) ──
-                    if index_options.get('textIndexVersion', 0) >= 3:
-                        self._print_warning(f"---- [MODIFIED] Index '{index_name}': Downgrading textIndexVersion from {index_options['textIndexVersion']} to 2")
-                        index_options['textIndexVersion'] = 2
-                
-                # ── Rule: Compound 2dsphere indexes not supported (#3) ──
-                is_2dsphere_compound = self._is_compound_geospatial_index(index_keys)
-                if is_2dsphere_compound:
-                    self._print_warning(f"---- [SKIPPED] Index '{index_name}': Compound 2dsphere indexes with regular fields are not supported")
-                    self.structural_incompatibilities.append({
+        self._print_info("-- Migrating indexes for collection")
+        self._print_verbose(f"Creating {len(index_list)} index(es) on destination")
+        created_index_names = set()  # Track created index names to detect conflicts
+        created_index_keys = set()  # Track created index key signatures to detect duplicates
+        has_text_index = False  # Only one text index allowed per collection
+        
+        for index_keys, index_options in index_list:
+            index_name = index_options.get('name', 'unnamed')
+            collection_ns = f"{db_name}.{dest_collection_name}"
+            
+            # ── Rule: Filter out unsupported index options (collation, hidden, etc.) ──
+            skip_index = False
+            for unsupported_opt in self.UNSUPPORTED_INDEX_OPTIONS:
+                if unsupported_opt in index_options:
+                    self._print_warning(f"---- [SKIPPED] Index '{index_name}': '{unsupported_opt}' option is not supported on destination")
+                    self._print_verbose(f"  Removing unsupported option '{unsupported_opt}' from index '{index_name}'")
+                    self._append_skipped_index_option({
                         'collection': collection_ns,
                         'index_name': index_name,
-                        'reason': 'Compound indexes mixing 2dsphere with regular fields are not supported.'
+                        'option': unsupported_opt,
+                        'value': index_options[unsupported_opt]
                     })
-                    continue
-                
-                # ── Rule: Compound wildcard indexes not supported ──
-                if self._is_compound_wildcard_index(index_keys):
-                    self._print_warning(f"---- [SKIPPED] Index '{index_name}': Compound wildcard indexes are not supported")
-                    self.structural_incompatibilities.append({
+                    skip_index = True
+            if skip_index:
+                continue
+            
+            # ── Rule: Only one text index allowed per collection (#1, #2, #42) ──
+            is_text_index = any(direction == 'text' for _, direction in index_keys)
+            if is_text_index:
+                if has_text_index:
+                    self._print_warning(f"---- [SKIPPED] Index '{index_name}': Only one text index is allowed per collection")
+                    self._append_structural_incompatibility({
                         'collection': collection_ns,
                         'index_name': index_name,
-                        'reason': 'Compound indexes mixing wildcard ($**) with other fields are not supported.'
+                        'reason': 'Only one text index is allowed per collection. A text index already exists.'
                     })
                     continue
+                has_text_index = True
+                # ── Rule: Downgrade textIndexVersion if needed (DocumentDB supports v1/v2) ──
+                if index_options.get('textIndexVersion', 0) >= 3:
+                    self._print_warning(f"---- [MODIFIED] Index '{index_name}': Downgrading textIndexVersion from {index_options['textIndexVersion']} to 2")
+                    index_options['textIndexVersion'] = 2
+            
+            # ── Rule: Compound 2dsphere indexes not supported (#3) ──
+            is_2dsphere_compound = self._is_compound_geospatial_index(index_keys)
+            if is_2dsphere_compound:
+                self._print_warning(f"---- [SKIPPED] Index '{index_name}': Compound 2dsphere indexes with regular fields are not supported")
+                self._append_structural_incompatibility({
+                    'collection': collection_ns,
+                    'index_name': index_name,
+                    'reason': 'Compound indexes mixing 2dsphere with regular fields are not supported.'
+                })
+                continue
+            
+            # ── Rule: Compound wildcard indexes not supported ──
+            if self._is_compound_wildcard_index(index_keys):
+                self._print_warning(f"---- [SKIPPED] Index '{index_name}': Compound wildcard indexes are not supported")
+                self._append_structural_incompatibility({
+                    'collection': collection_ns,
+                    'index_name': index_name,
+                    'reason': 'Compound indexes mixing wildcard ($**) with other fields are not supported.'
+                })
+                continue
+            
+            # ── Rule: Multiple hashed fields in compound not supported (#43) ──
+            hashed_field_count = sum(1 for _, direction in index_keys if direction == 'hashed')
+            if hashed_field_count > 1:
+                self._print_warning(f"---- [SKIPPED] Index '{index_name}': Multiple hashed fields in a single index are not supported")
+                self._append_structural_incompatibility({
+                    'collection': collection_ns,
+                    'index_name': index_name,
+                    'reason': f'A maximum of one hashed field is allowed per index but found {hashed_field_count}.'
+                })
+                continue
+            
+            # ── Rule: Geospatial indexes cannot have unique constraint ──
+            if self._is_geospatial_index(index_keys) and index_options.get('unique'):
+                self._print_warning(f"---- [MODIFIED] Index '{index_name}': Removing 'unique' option (not supported with geospatial indexes)")
+                del index_options['unique']
+            
+            # ── Rule: Skip duplicate index keys (can happen after hashed->regular conversion) ──
+            index_key_signature = str(index_keys)
+            if index_key_signature in created_index_keys:
+                self._print_warning(f"---- [SKIPPED] Index '{index_name}': Duplicate index keys {index_keys} already created")
+                continue
+            
+            # ── Rule: Cannot mix sparse and partialFilterExpression (#35) ──
+            if 'sparse' in index_options and 'partialFilterExpression' in index_options:
+                self._print_warning(f"---- [MODIFIED] Index '{index_name}': Removing 'sparse' option (cannot mix with partialFilterExpression)")
+                self._append_structural_incompatibility({
+                    'collection': collection_ns,
+                    'index_name': index_name,
+                    'reason': "Cannot mix 'sparse' and 'partialFilterExpression'. Removed 'sparse' option."
+                })
+                del index_options['sparse']
+            
+            # ── Rule: Strip empty partialFilterExpression (#46) ──
+            if 'partialFilterExpression' in index_options:
+                pfe = index_options['partialFilterExpression']
+                if isinstance(pfe, dict) and len(pfe) == 0:
+                    self._print_warning(f"---- [MODIFIED] Index '{index_name}': Removing empty partialFilterExpression")
+                    del index_options['partialFilterExpression']
+            
+            # Transform partialFilterExpression if present
+            if 'partialFilterExpression' in index_options:
+                self._print_verbose(f"  Processing partialFilterExpression for index: {index_name}")
                 
-                # ── Rule: Multiple hashed fields in compound not supported (#43) ──
-                hashed_field_count = sum(1 for _, direction in index_keys if direction == 'hashed')
-                if hashed_field_count > 1:
-                    self._print_warning(f"---- [SKIPPED] Index '{index_name}': Multiple hashed fields in a single index are not supported")
-                    self.structural_incompatibilities.append({
-                        'collection': collection_ns,
-                        'index_name': index_name,
-                        'reason': f'A maximum of one hashed field is allowed per index but found {hashed_field_count}.'
-                    })
+                transformed, is_compatible, issues = self._transform_partial_filter_expression(
+                    index_options['partialFilterExpression'],
+                    collection_ns,
+                    index_name
+                )
+                if not is_compatible:
+                    self._print_verbose(f"  Index has incompatible partialFilterExpression, skipping")
+                    self._print_warning(f"---- Skipping index '{index_name}' due to unsupported partialFilterExpression")
                     continue
-                
-                # ── Rule: Geospatial indexes cannot have unique constraint ──
-                if self._is_geospatial_index(index_keys) and index_options.get('unique'):
-                    self._print_warning(f"---- [MODIFIED] Index '{index_name}': Removing 'unique' option (not supported with geospatial indexes)")
-                    del index_options['unique']
-                
-                # ── Rule: Skip duplicate index keys (can happen after hashed->regular conversion) ──
-                index_key_signature = str(index_keys)
-                if index_key_signature in created_index_keys:
-                    self._print_warning(f"---- [SKIPPED] Index '{index_name}': Duplicate index keys {index_keys} already created")
-                    continue
-                
-                # ── Rule: Cannot mix sparse and partialFilterExpression (#35) ──
-                if 'sparse' in index_options and 'partialFilterExpression' in index_options:
-                    self._print_warning(f"---- [MODIFIED] Index '{index_name}': Removing 'sparse' option (cannot mix with partialFilterExpression)")
-                    self.structural_incompatibilities.append({
-                        'collection': collection_ns,
-                        'index_name': index_name,
-                        'reason': "Cannot mix 'sparse' and 'partialFilterExpression'. Removed 'sparse' option."
-                    })
-                    del index_options['sparse']
-                
-                # ── Rule: Strip empty partialFilterExpression (#46) ──
-                if 'partialFilterExpression' in index_options:
-                    pfe = index_options['partialFilterExpression']
-                    if isinstance(pfe, dict) and len(pfe) == 0:
-                        self._print_warning(f"---- [MODIFIED] Index '{index_name}': Removing empty partialFilterExpression")
-                        del index_options['partialFilterExpression']
-                
-                # Transform partialFilterExpression if present
-                if 'partialFilterExpression' in index_options:
-                    self._print_verbose(f"  Processing partialFilterExpression for index: {index_name}")
-                    
-                    transformed, is_compatible, issues = self._transform_partial_filter_expression(
-                        index_options['partialFilterExpression'],
-                        collection_ns,
-                        index_name
-                    )
-                    if not is_compatible:
-                        self._print_verbose(f"  Index has incompatible partialFilterExpression, skipping")
-                        self._print_warning(f"---- Skipping index '{index_name}' due to unsupported partialFilterExpression")
-                        continue
-                    index_options['partialFilterExpression'] = transformed
-                
-                # ── Rule: Detect and resolve index name conflicts ──
-                if index_name in created_index_names:
-                    # Name conflict — append a suffix to disambiguate
-                    suffix = 1
+                index_options['partialFilterExpression'] = transformed
+            
+            # ── Rule: Detect and resolve index name conflicts ──
+            if index_name in created_index_names:
+                # Name conflict — append a suffix to disambiguate
+                suffix = 1
+                new_name = f"{index_name}_dup{suffix}"
+                while new_name in created_index_names:
+                    suffix += 1
                     new_name = f"{index_name}_dup{suffix}"
-                    while new_name in created_index_names:
-                        suffix += 1
-                        new_name = f"{index_name}_dup{suffix}"
-                    self._print_warning(f"---- [RENAMED] Index '{index_name}' renamed to '{new_name}' to avoid name conflict")
-                    self._print_verbose(f"  Index name conflict detected: '{index_name}' -> '{new_name}'")
-                    index_options['name'] = new_name
-                    index_name = new_name
-                
-                created_index_names.add(index_name)
-                created_index_keys.add(index_key_signature)
-                self._print_success(f"---- Created index: {index_keys} with options: {index_options}")
-                self._print_verbose(f"  Creating index on destination: {index_keys}")
-                try:
-                    dest_collection.create_index(index_keys, **index_options)
-                    self._print_verbose(f"  Index created successfully")
-                except Exception as e:
-                    self._print_error(f"---- [ERROR] Failed to create index '{index_name}': {e}")
-                    self.structural_incompatibilities.append({
-                        'collection': collection_ns,
-                        'index_name': index_name,
-                        'reason': f'Failed to create index: {e}'
-                    })
-        
-        # Report all incompatible indexes at the end
-        self._report_incompatible_indexes()
-        self._report_skipped_index_options()
-        self._report_structural_incompatibilities()
-        
-        self._print_verbose(f"Migration completed for all {len(collection_configs)} collection(s)")
+                self._print_warning(f"---- [RENAMED] Index '{index_name}' renamed to '{new_name}' to avoid name conflict")
+                self._print_verbose(f"  Index name conflict detected: '{index_name}' -> '{new_name}'")
+                index_options['name'] = new_name
+                index_name = new_name
+            
+            created_index_names.add(index_name)
+            created_index_keys.add(index_key_signature)
+            self._print_success(f"---- Created index: {index_keys} with options: {index_options}")
+            self._print_verbose(f"  Creating index on destination: {index_keys}")
+            try:
+                dest_collection.create_index(index_keys, **index_options)
+                self._print_verbose(f"  Index created successfully")
+            except Exception as e:
+                self._print_error(f"---- [ERROR] Failed to create index '{index_name}': {e}")
+                self._append_structural_incompatibility({
+                    'collection': collection_ns,
+                    'index_name': index_name,
+                    'reason': f'Failed to create index: {e}'
+                })
 
     def _transform_partial_filter_expression(
             self,
@@ -577,7 +725,7 @@ class SchemaMigration:
         
         # Record incompatibility if found
         if not is_compatible:
-            self.incompatible_indexes.append({
+            self._append_incompatible_index({
                 'collection': collection_namespace,
                 'index_name': index_name,
                 'issues': issues,
@@ -662,6 +810,27 @@ class SchemaMigration:
         self._print_warning("="*80)
         self._print_warning("Please review these indexes and manually adjust them for the destination.")
         self._print_warning("="*80 + "\n")
+
+    def _report_failed_collections(self) -> None:
+        """
+        Report all collections that failed during migration.
+        """
+        if not self.failed_collections:
+            return
+        
+        self._print_error("\n" + "="*80)
+        self._print_error("FAILED COLLECTIONS REPORT")
+        self._print_error("="*80)
+        self._print_error(f"\n{len(self.failed_collections)} collection(s) failed during migration:\n")
+        
+        for idx, entry in enumerate(self.failed_collections, 1):
+            self._print_error(f"{idx}. Collection: {entry['collection']}")
+            self._print_error(f"   Error: {entry['error']}")
+            print()
+        
+        self._print_error("="*80)
+        self._print_error("Please review and retry these collections manually.")
+        self._print_error("="*80 + "\n")
 
     def _is_compound_geospatial_index(self, index_keys: List[Tuple[str, Any]]) -> bool:
         """
@@ -777,20 +946,22 @@ class SchemaMigration:
         :param collection_ns: The namespace (db.collection) of the collection.
         :param shard_key: The shard key definition from the source.
         """
-        # Load existing data if the file already exists
-        data = {}
-        if os.path.exists(export_path):
-            try:
-                with open(export_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, IOError):
-                data = {}
+        # Thread-safe file write using lock
+        with self._lock:
+            # Load existing data if the file already exists
+            data = {}
+            if os.path.exists(export_path):
+                try:
+                    with open(export_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    data = {}
 
-        data[collection_ns] = shard_key
+            data[collection_ns] = shard_key
 
-        os.makedirs(os.path.dirname(export_path) or '.', exist_ok=True)
-        with open(export_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
+            os.makedirs(os.path.dirname(export_path) or '.', exist_ok=True)
+            with open(export_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
 
         self._print_success(f"-- Exported shard key for {collection_ns} to {export_path}")
         self._print_verbose(f"  Shard key exported: {shard_key}")

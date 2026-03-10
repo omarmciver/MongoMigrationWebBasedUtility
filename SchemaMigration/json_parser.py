@@ -91,11 +91,16 @@ class JsonParser:
         for collection in collection_list:
             if collection == "*":
                 self._print_verbose(f"    Pattern '*' detected - enumerating all databases and collections")
-                # Include all collections in all databases
+                # Include all collections in all databases (skip system databases)
+                system_dbs = {"admin", "config", "local"}
                 for db_name in self.mongo_client.list_database_names():
+                    if db_name in system_dbs or db_name.startswith("system"):
+                        self._print_verbose(f"    Skipping system database: {db_name}")
+                        continue
                     source_db = self.mongo_client[db_name]
                     for collection_name in source_db.list_collection_names():
-                        collection_set.add(f"{db_name}.{collection_name}")
+                        if not collection_name.startswith("system."):
+                            collection_set.add(f"{db_name}.{collection_name}")
                 self._print_verbose(f"    Found {len(collection_set)} total collection(s) across all databases")
             elif ".*" in collection:
                 # Include all collections in a specific database

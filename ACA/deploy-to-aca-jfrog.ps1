@@ -81,7 +81,7 @@ param(
     [string]$ImageName = "mongo-migration",
     
     [Parameter(Mandatory=$false)]
-    [string]$ImageTag = "latest",
+    [string]$ImageTag = "",
     
     [Parameter(Mandatory=$false)]
     [ValidateRange(1, 32)]
@@ -135,6 +135,13 @@ if (-not $UpdateOnly) {
         Write-Host "Use -UpdateOnly to skip infrastructure deployment and only update the container image." -ForegroundColor Yellow
         exit 1
     }
+}
+
+# Generate a timestamp-based image tag if not provided (YYYYMMDDHHmm)
+# This ensures each build produces a unique tag so ACA always creates a new revision
+if ([string]::IsNullOrEmpty($ImageTag)) {
+    $ImageTag = Get-Date -Format "yyyyMMddHHmm"
+    Write-Host "Using generated image tag: $ImageTag" -ForegroundColor Cyan
 }
 
 # Use the same registry for base images if not specified

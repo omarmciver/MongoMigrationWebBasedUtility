@@ -15,6 +15,7 @@ namespace OnlineMongoMigrationProcessor.Helpers
         private static List<string> _trackersToRemove = new List<string>();
 
         private static System.Timers.Timer _timer =new System.Timers.Timer(PERCENTAGE_UPDATE_INTERVAL_MS);
+        private static bool _timerHandlerAttached = false;
         
         private static Log _log;
 
@@ -26,7 +27,7 @@ namespace OnlineMongoMigrationProcessor.Helpers
                 _activeTrackers = new SafeDictionary<string, bool>();
                 _trackersToRemove = new List<string>();
                 _timer.Stop();
-
+                _timerHandlerAttached = false;
             }
             finally
             {
@@ -48,12 +49,16 @@ namespace OnlineMongoMigrationProcessor.Helpers
 
             if (!_timer.Enabled)
             {                
-                _timer.Elapsed += (sender, e) =>
+                if (!_timerHandlerAttached)
                 {
-                    TimerTick();
-                };
+                    _timer.Elapsed += (sender, e) =>
+                    {
+                        TimerTick();
+                    };
+                    _timerHandlerAttached = true;
+                }
                 _timer.Start();
-            }            
+            }
         }
 
         public static void RemovePercentageTracker(string id, bool isRestore, Log log)

@@ -1072,6 +1072,9 @@ namespace OnlineMongoMigrationProcessor
 
         private bool HasSufficientDiskSpace()
         {
+            //HACK: When using local disk for staging, this becomes very inefficient as calculating space involves itterating all blobs.
+            return true;
+
             // When using Azure Blob Storage with Entra ID, skip disk space check
             // as blob storage has virtually unlimited capacity
             if (StorageStreamFactory.UseBlobStorage)

@@ -51,6 +51,9 @@ namespace OnlineMongoMigrationProcessor.Workers
         
         // Track resume token setup tasks per collection to enable per-collection waiting
         private Dictionary<string, Task> _resumeTokenTasksByCollection = new Dictionary<string, Task>();
+
+        // Shared prep context for DumpAndRestore pipeline mode (inline prep in MigrateJobCollections)
+        private PartitionPrepContext? _dumpRestorePrepContext;
        
         public MigrationWorker()
         {            
@@ -934,13 +937,26 @@ namespace OnlineMongoMigrationProcessor.Workers
 
         private async Task<TaskResult> MigrateJobCollections(bool syncBack,CancellationToken ctsToken)
         {
-            _log.WriteLine("MigrateJobCollections started", LogType.Debug);
+            _log.WriteLine("MigrateJobCollections started", LogType.Info);
 
             if (MigrationJobContext.CurrentlyActiveJob == null)
                 return TaskResult.FailedAfterRetries;
 
             List<Task> resumeTokenTasks = new List<Task>();
-            _log.WriteLine($"Processing {MigrationJobContext.CurrentlyActiveJob.MigrationUnitBasics.Count} migration units", LogType.Debug);
+            _log.WriteLine($"Processing {MigrationJobContext.CurrentlyActiveJob.MigrationUnitBasics.Count} migration units", LogType.Info);
+
+            // For DumpAndRestore pipeline (Phase 1 skipped), pre-mark all Unknown MUBs as OK.
+            // This prevents IsOfflineJobCompleted from treating unvalidated collections as "not needing migration"
+            // and prematurely completing the job. Actual validation in ProcessMigrationUnitAsync will
+            // override with NotFound/IsView as appropriate.
+            if (MigrationJobContext.CurrentlyActiveJob.JobType == JobType.DumpAndRestore)
+            {
+                foreach (var m in MigrationJobContext.CurrentlyActiveJob.MigrationUnitBasics)
+                {
+                    if (m.SourceStatus == CollectionStatus.Unknown)
+                        m.SourceStatus = CollectionStatus.OK;
+                }
+            }
 
             foreach (var mub in MigrationJobContext.CurrentlyActiveJob.MigrationUnitBasics)
             {
@@ -979,17 +995,33 @@ namespace OnlineMongoMigrationProcessor.Workers
             var migrationUnit = MigrationJobContext.GetMigrationUnit(mub.Id);
             migrationUnit.ParentJob = MigrationJobContext.CurrentlyActiveJob;
 
+            // For DumpAndRestore pipeline (Phase 1 skipped), SourceStatus hasn't been set yet.
+            // Allow Unknown status to fall through to ValidateSourceCollectionAsync below, which will set it.
             if (!Helper.IsMigrationUnitValid(migrationUnit))
-                return TaskResult.Success;
+            {
+                if (MigrationJobContext.CurrentlyActiveJob?.JobType == JobType.DumpAndRestore
+                    && migrationUnit.SourceStatus == CollectionStatus.Unknown)
+                {
+                    // Fall through to validation
+                }
+                else
+                {
+                    return TaskResult.Success;
+                }
+            }
 
             if (migrationUnit.SourceStatus == CollectionStatus.IsView)
                 return TaskResult.Success;
+
+            if (MigrationJobContext.CurrentlyActiveJob?.JobType == JobType.DumpAndRestore)
+                _log.WriteLine($"Pipeline: validating source for {migrationUnit.DatabaseName}.{migrationUnit.CollectionName}", LogType.Info);
 
             var (exists, isCollection) = await ValidateSourceCollectionAsync(migrationUnit);
 
             if (!isCollection)
             {
                 migrationUnit.SourceStatus = CollectionStatus.IsView;
+                mub.SourceStatus = CollectionStatus.IsView;
                 _log.WriteLine($"{migrationUnit.DatabaseName}.{migrationUnit.CollectionName} is not a collection. Only collections are supported for migration.", LogType.Warning);
                 return TaskResult.Success;
             }
@@ -997,9 +1029,13 @@ namespace OnlineMongoMigrationProcessor.Workers
             if (!exists)
             {
                 migrationUnit.SourceStatus = CollectionStatus.NotFound;
+                mub.SourceStatus = CollectionStatus.NotFound;
                 _log.WriteLine($"{migrationUnit.DatabaseName}.{migrationUnit.CollectionName} does not exist on source. Created empty collection.", LogType.Warning);
                 return TaskResult.Abort;
             }
+
+            if (MigrationJobContext.CurrentlyActiveJob?.JobType == JobType.DumpAndRestore)
+                _log.WriteLine($"Pipeline: source validated for {migrationUnit.DatabaseName}.{migrationUnit.CollectionName}, validating target", LogType.Info);
 
             await ValidateTargetCollectionExistsAsync(migrationUnit);
 
@@ -1072,9 +1108,37 @@ namespace OnlineMongoMigrationProcessor.Workers
             if (_migrationProcessor == null)
                 return TaskResult.Abort;
 
+            // For DumpAndRestore pipeline: inline prep work that's normally done in PreparePartitionsAsync.
+            // This creates a pipeline where each collection flows: validate → prep → partition → dump → restore
+            // while the coordinator processes previously-queued collections concurrently.
+            if (MigrationJobContext.CurrentlyActiveJob?.JobType == JobType.DumpAndRestore
+                && (migrationUnit.MigrationChunks == null || migrationUnit.MigrationChunks.Count == 0))
+            {
+                _log.WriteLine($"Pipeline: inline prep starting for {migrationUnit.DatabaseName}.{migrationUnit.CollectionName}", LogType.Info);
+
+                await UpdateDocumentCountsAsync(migrationUnit, ctsToken);
+
+                if (HandleControlPause())
+                    return TaskResult.Canceled;
+
+                _dumpRestorePrepContext ??= new PartitionPrepContext();
+                var prepResult = await PrepareTargetCollectionAsync(migrationUnit, _dumpRestorePrepContext, ctsToken);
+                if (prepResult != TaskResult.Success)
+                {
+                    _log.WriteLine($"Pipeline: PrepareTargetCollectionAsync returned {prepResult} for {migrationUnit.DatabaseName}.{migrationUnit.CollectionName}", LogType.Warning);
+                    return prepResult;
+                }
+
+                MigrationJobContext.SaveMigrationUnit(migrationUnit, false);
+                _log.WriteLine($"Pipeline: inline prep complete for {migrationUnit.DatabaseName}.{migrationUnit.CollectionName}, starting partitioning", LogType.Info);
+            }
+
             var createPartitionsResult = await CreatePartitionsAsync(migrationUnit, ctsToken);
             if (createPartitionsResult != TaskResult.Success)
+            {
+                _log.WriteLine($"Pipeline: CreatePartitionsAsync returned {createPartitionsResult} for {migrationUnit.DatabaseName}.{migrationUnit.CollectionName}", LogType.Warning);
                 return createPartitionsResult;
+            }
 
             if (HandleControlPause())
                 return TaskResult.Canceled;
@@ -1214,6 +1278,8 @@ namespace OnlineMongoMigrationProcessor.Workers
 
                 
                 // Call keep-alive API if configured
+                // HACK: Skipping this for now, as when the app is not exposed via it's expected URL (like when behind a non-resolvable Private Endpoint), it causes unnecessary delays without any benefit.
+                useKeepAlive = false;
                 if (useKeepAlive)
                 {
                     counter++;
@@ -1579,6 +1645,16 @@ namespace OnlineMongoMigrationProcessor.Workers
 
         private async Task<bool> ExecutePreparePartitionsAsync()
         {
+            // For DumpAndRestore: skip the separate preparation phase entirely.
+            // Prep + partitioning will be done inline during MigrateJobCollections,
+            // creating a pipeline where each collection flows: validate → prep → partition → dump → restore
+            // while subsequent collections are being prepared concurrently by the coordinator.
+            if (MigrationJobContext.CurrentlyActiveJob?.JobType == JobType.DumpAndRestore)
+            {
+                _log.WriteLine("DumpAndRestore pipeline: skipping separate preparation phase - prep and partitioning will be done inline per collection");
+                return true;
+            }
+
             MigrationJobContext.AddVerboseLog("Starting PreparePartitionsAsync with retry logic");
             bool skipPartitioning = false;
 

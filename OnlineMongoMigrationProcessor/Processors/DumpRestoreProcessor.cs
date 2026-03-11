@@ -120,6 +120,7 @@ namespace OnlineMongoMigrationProcessor
                     onMigrationUnitCompleted: OnMigrationUnitCompleted,
                     onPendingTasksCompleted: OnPendingTasksCompleted
                 );
+                PercentageUpdater.Initialize();
             }
 
         }
@@ -149,7 +150,6 @@ namespace OnlineMongoMigrationProcessor
 
             //initialize coordinator if not already done
             InitializeCoordinator();
-            PercentageUpdater.Initialize();
 
             // Delegate dump/restore coordination to the coordinator
             _coordinator.StartCoordinatedProcess(ctx);

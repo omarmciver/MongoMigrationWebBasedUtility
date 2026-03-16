@@ -88,6 +88,8 @@ namespace OnlineMongoMigrationProcessor.Processors
         {
             var databaseName = mu.DatabaseName;
             var collectionName = mu.CollectionName;
+            var targetDatabaseName = mu.GetEffectiveTargetDatabaseName();
+            var targetCollectionName = mu.GetEffectiveTargetCollectionName();
             var database = _sourceClient?.GetDatabase(databaseName);
             var collection = database?.GetCollection<BsonDocument>(collectionName);
 
@@ -99,6 +101,8 @@ namespace OnlineMongoMigrationProcessor.Processors
                 JobId = MigrationJobContext.CurrentlyActiveJob?.Id ?? string.Empty,
                 DatabaseName = databaseName,
                 CollectionName = collectionName,
+                TargetDatabaseName = targetDatabaseName,
+                TargetCollectionName = targetCollectionName,
                 Database = database!,
                 Collection = collection!,
             };

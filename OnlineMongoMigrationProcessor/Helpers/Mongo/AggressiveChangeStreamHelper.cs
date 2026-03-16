@@ -124,9 +124,10 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
         /// <param name="sourceDatabaseName">Source database name</param>
         /// <param name="sourceCollectionName">Source collection name</param>
         /// <returns>Number of documents deleted from target collection</returns>
-        public async Task<long> DeleteStoredDocsAsync(string sourceDatabaseName, string sourceCollectionName)
+        public async Task<long> DeleteStoredDocsAsync(string sourceDatabaseName, string sourceCollectionName, string targetDatabaseName, string targetCollectionName)
         {
             MigrationJobContext.AddVerboseLog($"Processing DeleteStoredDocsAsync for {sourceDatabaseName}.{sourceCollectionName}");
+            var namespaceForLog = Log.FormatNamespaceForLog(sourceDatabaseName, sourceCollectionName, targetDatabaseName, targetCollectionName);
 
             try
             {
@@ -143,8 +144,8 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                 }
 
                 // Get target collection
-                var targetDb = _targetClient.GetDatabase(sourceDatabaseName);
-                var targetCollection = targetDb.GetCollection<BsonDocument>(sourceCollectionName);
+                var targetDb = _targetClient.GetDatabase(targetDatabaseName);
+                var targetCollection = targetDb.GetCollection<BsonDocument>(targetCollectionName);
 
                 long totalDeletedCount = 0;
                 const int pageSize = 1000; // Process 1000 documents at a time from temp collection
@@ -193,12 +194,12 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                             {
                                 var result = await targetCollection.BulkWriteAsync(deleteModels, new BulkWriteOptions { IsOrdered = false });
                                 totalDeletedCount += result.DeletedCount;
-                                _log.ShowInMonitor($"Deleted {result.DeletedCount} documents from {sourceDatabaseName}.{sourceCollectionName} (page {pageNumber + 1}, batch {i / deleteBatchSize + 1})");
+                                _log.ShowInMonitor($"Deleted {result.DeletedCount} documents from {namespaceForLog} (page {pageNumber + 1}, batch {i / deleteBatchSize + 1})");
                             }
                             catch (MongoBulkWriteException<BsonDocument> ex)
                             {
                                 totalDeletedCount += ex.Result?.DeletedCount ?? 0;
-                                _log.WriteLine($"Bulk delete partially failed for {sourceDatabaseName}.{sourceCollectionName} (page {pageNumber + 1}, batch {i / deleteBatchSize + 1}). Details: {ex}", LogType.Error);
+                                _log.WriteLine($"Bulk delete partially failed for {namespaceForLog} (page {pageNumber + 1}, batch {i / deleteBatchSize + 1}). Details: {ex}", LogType.Error);
                             }
                         }
                     }
@@ -208,7 +209,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
 
                 // Clean up temp collection after processing
                 await tempDb.DropCollectionAsync(tempCollectionName);
-                _log.WriteLine($"Processed aggressive change stream deletes for {sourceDatabaseName}.{sourceCollectionName}: {totalDeletedCount} documents deleted, temp collection cleaned up");
+                _log.WriteLine($"Processed aggressive change stream deletes for {namespaceForLog}: {totalDeletedCount} documents deleted, temp collection cleaned up");
 
                 return totalDeletedCount;
             }
@@ -227,9 +228,10 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
         /// <param name="sourceCollectionName">Source collection name</param>
         /// <param name="sourceClient">Source MongoDB client to read documents from</param>
         /// <returns>Tuple with counts of (inserted, updated, skipped) documents</returns>
-        public async Task<(long Inserted, long Updated, long Skipped)> ApplyStoredChangesAsync(string sourceDatabaseName, string sourceCollectionName, MongoClient sourceClient)
+        public async Task<(long Inserted, long Updated, long Skipped)> ApplyStoredChangesAsync(string sourceDatabaseName, string sourceCollectionName, string targetDatabaseName, string targetCollectionName, MongoClient sourceClient)
         {
             MigrationJobContext.AddVerboseLog($"Processing ApplyStoredChangesAsync for {sourceDatabaseName}.{sourceCollectionName}");
+            var namespaceForLog = Log.FormatNamespaceForLog(sourceDatabaseName, sourceCollectionName, targetDatabaseName, targetCollectionName);
             try
             {
                 var tempDb = _targetClient.GetDatabase(_jobId);
@@ -248,9 +250,9 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                 var sourceDb = sourceClient.GetDatabase(sourceDatabaseName);
                 var sourceCollection = sourceDb.GetCollection<BsonDocument>(sourceCollectionName);
                 var sourceRawCollection = sourceDb.GetCollection<RawBsonDocument>(sourceCollectionName);
-                var targetDb = _targetClient.GetDatabase(sourceDatabaseName);
-                var targetCollection = targetDb.GetCollection<BsonDocument>(sourceCollectionName);
-                var targetRawCollection = targetDb.GetCollection<RawBsonDocument>(sourceCollectionName);
+                var targetDb = _targetClient.GetDatabase(targetDatabaseName);
+                var targetCollection = targetDb.GetCollection<BsonDocument>(targetCollectionName);
+                var targetRawCollection = targetDb.GetCollection<RawBsonDocument>(targetCollectionName);
 
                 long totalInserted = 0;
                 long totalUpdated = 0;
@@ -312,7 +314,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                     pageNumber++;
                 }
 
-                _log.WriteLine($"Applied stored changes for {sourceDatabaseName}.{sourceCollectionName}: {totalInserted} inserted, {totalUpdated} updated, {totalSkipped} skipped");
+                _log.WriteLine($"Applied stored changes for {namespaceForLog}: {totalInserted} inserted, {totalUpdated} updated, {totalSkipped} skipped");
 
                 return (totalInserted, totalUpdated, totalSkipped);
             }

@@ -51,10 +51,10 @@ namespace OnlineMongoMigrationProcessor.Helpers
                     }
 
                     var sourceDb = sourceClient.GetDatabase(mu.DatabaseName);
-                    var targetDb = targetClient.GetDatabase(mu.DatabaseName);
+                    var targetDb = targetClient.GetDatabase(mu.GetEffectiveTargetDatabaseName());
 
                     var sourceCollection = sourceDb.GetCollection<RawBsonDocument>(mu.CollectionName);
-                    var targetCollection = targetDb.GetCollection<RawBsonDocument>(mu.CollectionName);
+                    var targetCollection = targetDb.GetCollection<RawBsonDocument>(mu.GetEffectiveTargetCollectionName());
 
                     DateTime currTime = DateTime.UtcNow;
 

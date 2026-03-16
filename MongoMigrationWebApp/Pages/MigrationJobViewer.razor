@@ -291,9 +291,9 @@
                                @onclick="() => ShowCollectionDetails(mu)"></i>
                             <i class="bi bi-download me-2 collection-info-icon" title="Download JSON" style="cursor: pointer;"
                                @onclick="() => DownloadMigrationUnit(mu)"></i>
-                            @mu.DatabaseName
+                                     @GetDatabaseDisplayName(mu)
                         </td>
-                        <td>@mu.CollectionName</td>
+                                <td>@GetCollectionDisplayName(mu)</td>
                         <td>
                             @(mu.SourceStatus == CollectionStatus.NotFound ? "Skipped (404)"
                                                 : mu.SourceStatus == CollectionStatus.IsView ? "Skipped (VIEW)"
@@ -1060,6 +1060,24 @@ else if (@_showLogBackupFile)
         _collectionDetailsDialogOpen = true;
     }
 
+    private static string FormatNameWithTarget(string sourceName, string? targetName)
+    {
+        return string.IsNullOrWhiteSpace(targetName) ||
+               string.Equals(sourceName, targetName, StringComparison.OrdinalIgnoreCase)
+            ? sourceName
+            : $"{sourceName} ({targetName})";
+    }
+
+    private static string GetDatabaseDisplayName(MigrationUnitBasic mu)
+    {
+        return FormatNameWithTarget(mu.DatabaseName, mu.TargetDatabaseName);
+    }
+
+    private static string GetCollectionDisplayName(MigrationUnitBasic mu)
+    {
+        return FormatNameWithTarget(mu.CollectionName, mu.TargetCollectionName);
+    }
+
     private List<MigrationJob> GetMigrations()
     {
         var ids = JobManager.GetMigrationIds();
@@ -1519,6 +1537,12 @@ else if (@_showLogBackupFile)
 
         if (migrationUnits != null && CurrentlyLoadedMigrationJob != null)
         {
+            if (!Helper.ValidateNoTargetNamespaceClashes(migrationUnits, out var clashError))
+            {
+                _errorMessage = clashError;
+                return;
+            }
+
             // Get IDs for comparison
             var existingIds = CurrentlyLoadedMigrationJob.MigrationUnitBasics.Select(mu => mu.Id).ToHashSet();
             var newIds = migrationUnits.Select(mu => mu.Id).ToHashSet();
@@ -1548,9 +1572,13 @@ else if (@_showLogBackupFile)
             //         Helper.AddMigrationUnit(mu, CurrentlyLoadedMigrationJob);
             //     }
             // }
-            Helper.AddMigrationUnits(migrationUnits, CurrentlyLoadedMigrationJob);
+            if (!Helper.AddMigrationUnits(migrationUnits, CurrentlyLoadedMigrationJob))
+            {
+                _errorMessage = "Target namespace clash detected. Multiple source collections cannot map to the same target collection.";
+                return;
+            }
 
-            CurrentlyLoadedMigrationJob.NameSpaces = string.Join(",", migrationUnits.Select(x => x.DatabaseName + "." + x.CollectionName));
+            CurrentlyLoadedMigrationJob.NameSpaces = Helper.BuildNamespaceConfigFromMigrationUnits(migrationUnits);
 
             MigrationJobContext.SaveMigrationJob(CurrentlyLoadedMigrationJob);
 

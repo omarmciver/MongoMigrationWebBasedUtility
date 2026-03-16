@@ -147,13 +147,13 @@ The script supports flexible resource allocation to match your workload requirem
 -VCores 4 -MemoryGB 16
 
 # Default production workload  
-# (uses defaults: 8 vCores, 32GB - no parameters needed)
+# (uses defaults: 8 vCores, 32GB, 100GB file share - no parameters needed)
 
 # Large workload (high-performance migration)
--VCores 16 -MemoryGB 64
+-VCores 16 -MemoryGB 64 -FileShareSizeGB 500
 
 # Maximum workload (enterprise-scale migration)
--VCores 32 -MemoryGB 64
+-VCores 32 -MemoryGB 64 -FileShareSizeGB 1024
 ```
 
 ---
@@ -1121,7 +1121,7 @@ az storage file list `
 
 ### Increase Disk Space
 
-If the application reports **"Disk space is running low"** error, you can increase the Azure File Share size:
+If your migration workload requires more storage, increase the Azure File Share size:
 
 ```powershell
 # Check current quota/size
@@ -1144,20 +1144,6 @@ az storage share show `
   --name migration-data `
   --query "properties.quota" `
   --output tsv
-
-# Update the Container App environment variable to reflect the new quota
-az containerapp update `
-  --name <containerAppName> `
-  --resource-group <resource-group-name> `
-  --set-env-vars STORAGE_QUOTA_GB=200
-
-# Then run the update script to create a new revision and activate the changes
-.\update-aca-app.ps1 `
-  -ResourceGroupName "MongoMigrationRGTest" `
-  -ContainerAppName "mongomigration" `
-  -AcrName "sharedacr" `
-  -AcrRepository "myapp" `
-  -ImageTag "v1.1"
 ```
 
 > ⚠️ **Warning**: Only perform this operation when **no migration job is running**. Restarting the Container App will interrupt any active migration processes. Check the application's job status page before proceeding.
@@ -1166,8 +1152,8 @@ az containerapp update `
 - The default deployment creates a 100GB Azure File Share
 - You can increase up to 100TB (102,400 GB) for standard storage accounts
 - **The file share change takes effect immediately** - the mounted volume automatically reflects the new capacity
-- **Run `update-aca-app.ps1` after updating the environment variable** - this creates and activates a new revision with the updated `STORAGE_QUOTA_GB` value
-- Your application can read this value using `Environment.GetEnvironmentVariable("STORAGE_QUOTA_GB")`
+- For ACA deployments that use a mounted Azure Files disk, set a sufficiently large file share quota before long-running migrations.
+- The migration app does not perform free-space checks for mounted ACA disk scenarios, so quota planning is required.
 - Pricing is based on provisioned size, not used space - see [Azure Files Pricing](https://azure.microsoft.com/pricing/details/storage/files/)
 - Monitor disk usage through the application's monitoring interface to plan capacity increases
 

@@ -82,6 +82,8 @@ namespace OnlineMongoMigrationProcessor
 
         public static bool CanProceedWithDownloads(string directoryPath,long spaceRequiredInMb, out double folderSizeInGB, out double freeSpaceGB)
         {
+
+            
             
             freeSpaceGB = 0;
             folderSizeInGB = 0;
@@ -600,8 +602,16 @@ namespace OnlineMongoMigrationProcessor
             {
                 foreach (var item in loadedObject)
                 {
+                    var sourceDatabaseName = item.DatabaseName.Trim();
+                    var sourceCollectionName = item.CollectionName.Trim();
+                    var targetDatabaseName = string.IsNullOrWhiteSpace(item.TargetDatabaseName)
+                        ? sourceDatabaseName
+                        : item.TargetDatabaseName.Trim();
+                    var targetCollectionName = string.IsNullOrWhiteSpace(item.TargetCollectionName)
+                        ? sourceCollectionName
+                        : item.TargetCollectionName.Trim();
 
-                    var tmpList = await PopulateJobCollectionsFromCSVAsync(job,$"{item.DatabaseName.Trim()}.{item.CollectionName.Trim()}", connectionString,false);
+                    var tmpList = await PopulateJobCollectionsFromCSVAsync(job,$"{sourceDatabaseName}.{sourceCollectionName}", connectionString,false);
                     if (tmpList.Count > 0)
                     {
                         foreach (var mu in tmpList)
@@ -610,6 +620,8 @@ namespace OnlineMongoMigrationProcessor
                             if (!unitsToAdd.Any(x => x.DatabaseName == mu.DatabaseName && x.CollectionName == mu.CollectionName))
                             {
                                 mu.UserFilter = item.Filter;
+                                mu.TargetDatabaseName = targetDatabaseName;
+                                mu.TargetCollectionName = targetCollectionName;
 
 
                                 if (!string.IsNullOrEmpty(item.DataTypeFor_Id) && Enum.TryParse<DataType>(item.DataTypeFor_Id, out var parsedDataType))
@@ -641,6 +653,17 @@ namespace OnlineMongoMigrationProcessor
                 }
             }
 
+            foreach (var mu in unitsToAdd)
+            {
+                mu.TargetDatabaseName = string.IsNullOrWhiteSpace(mu.TargetDatabaseName) ? mu.DatabaseName : mu.TargetDatabaseName;
+                mu.TargetCollectionName = string.IsNullOrWhiteSpace(mu.TargetCollectionName) ? mu.CollectionName : mu.TargetCollectionName;
+            }
+
+            if (!ValidateNoTargetNamespaceClashes(unitsToAdd, out var clashError))
+            {
+                throw new InvalidOperationException(clashError);
+            }
+
 
             return unitsToAdd;
         }
@@ -660,6 +683,22 @@ namespace OnlineMongoMigrationProcessor
                 .Where(mu => !job.MigrationUnitBasics
                 .Any(mub => mub.Id == Helper.GenerateMigrationUnitId(mu.DatabaseName, mu.CollectionName)))
                 .ToList();
+
+            var candidateUnits = job.MigrationUnitBasics
+                .Select(mu =>
+                {
+                    mu.TargetDatabaseName = string.IsNullOrWhiteSpace(mu.TargetDatabaseName) ? mu.DatabaseName : mu.TargetDatabaseName;
+                    mu.TargetCollectionName = string.IsNullOrWhiteSpace(mu.TargetCollectionName) ? mu.CollectionName : mu.TargetCollectionName;
+                    return mu;
+                })
+                .Concat(newUnits.Select(mu => (MigrationUnitBasic)mu))
+                .ToList();
+
+            if (!ValidateNoTargetNamespaceClashes(candidateUnits, out var clashError))
+            {
+                log?.WriteLine(clashError, LogType.Error);
+                return false;
+            }
 
             if (newUnits.Count > 0)
             {
@@ -825,6 +864,21 @@ namespace OnlineMongoMigrationProcessor
 
                 foreach (var item in loadedObject)
                 {                   
+                    var sourceDatabaseName = item.DatabaseName.Trim();
+                    var sourceCollectionName = item.CollectionName.Trim();
+                    var targetDatabaseName = string.IsNullOrWhiteSpace(item.TargetDatabaseName)
+                        ? sourceDatabaseName
+                        : item.TargetDatabaseName.Trim();
+                    var targetCollectionName = string.IsNullOrWhiteSpace(item.TargetCollectionName)
+                        ? sourceCollectionName
+                        : item.TargetCollectionName.Trim();
+
+                    if ((!string.IsNullOrWhiteSpace(item.TargetDatabaseName) || !string.IsNullOrWhiteSpace(item.TargetCollectionName)) &&
+                        (sourceDatabaseName == "*" || sourceCollectionName == "*"))
+                    {
+                        errorMessage = "Target database/collection mapping is not supported with wildcard source namespaces. Please provide explicit source namespaces when using target mapping.";
+                        return new Tuple<bool, string, string>(false, string.Empty, errorMessage);
+                    }
 
                     if(!string.IsNullOrEmpty(item.Filter) && !FilterInspector.HasValidIdFilter(item.Filter))
                     {
@@ -832,19 +886,101 @@ namespace OnlineMongoMigrationProcessor
                         return new Tuple<bool, string, string>(false, string.Empty, errorMessage);
                     }
 
-                    var validationResult = ValidateNamespaceFormatfromCSV($"{item.DatabaseName.Trim()}.{item.CollectionName.Trim()}",false);
+                    var validationResult = ValidateNamespaceFormatfromCSV($"{sourceDatabaseName}.{sourceCollectionName}",false);
                     if (!validationResult.Item1)
                     {
                         errorMessage = validationResult.Item2;
                         return new Tuple<bool, string,string>(false, string.Empty, errorMessage);
-                    }                     
+                    }
+
+                    var targetValidationResult = ValidateNamespaceFormatfromCSV($"{targetDatabaseName}.{targetCollectionName}", false);
+                    if (!targetValidationResult.Item1)
+                    {
+                        errorMessage = $"Invalid target namespace format for '{item.DatabaseName}.{item.CollectionName}': {targetValidationResult.Item3}";
+                        return new Tuple<bool, string, string>(false, string.Empty, errorMessage);
+                    }
                 }
+
+                var mappedNamespaces = loadedObject
+                    .Select(item => new
+                    {
+                        Source = $"{item.DatabaseName.Trim()}.{item.CollectionName.Trim()}",
+                        Target = $"{(string.IsNullOrWhiteSpace(item.TargetDatabaseName) ? item.DatabaseName.Trim() : item.TargetDatabaseName.Trim())}.{(string.IsNullOrWhiteSpace(item.TargetCollectionName) ? item.CollectionName.Trim() : item.TargetCollectionName.Trim())}"
+                    })
+                    .ToList();
+
+                var collision = mappedNamespaces
+                    .GroupBy(x => x.Target, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault(g => g.Select(v => v.Source).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1);
+
+                if (collision != null)
+                {
+                    var sources = string.Join(", ", collision.Select(x => x.Source).Distinct(StringComparer.OrdinalIgnoreCase));
+                    errorMessage = $"Target namespace clash detected: {collision.Key} is mapped from multiple source namespaces ({sources}).";
+                    return new Tuple<bool, string, string>(false, string.Empty, errorMessage);
+                }
+
                 return new Tuple<bool, string,string >(true, input, errorMessage);
             }
             else
             {
                 return ValidateNamespaceFormatfromCSV(input);
             }
+        }
+
+        public static bool ValidateNoTargetNamespaceClashes(IEnumerable<MigrationUnitBasic> units, out string errorMessage)
+        {
+            errorMessage = string.Empty;
+
+            var collision = units
+                .Select(mu => new
+                {
+                    Source = $"{mu.DatabaseName}.{mu.CollectionName}",
+                    Target = $"{mu.GetEffectiveTargetDatabaseName()}.{mu.GetEffectiveTargetCollectionName()}"
+                })
+                .GroupBy(x => x.Target, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault(g => g.Select(v => v.Source).Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1);
+
+            if (collision == null)
+            {
+                return true;
+            }
+
+            var sources = string.Join(", ", collision.Select(x => x.Source).Distinct(StringComparer.OrdinalIgnoreCase));
+            errorMessage = $"Target namespace clash detected: {collision.Key} is mapped from multiple source namespaces ({sources}).";
+            return false;
+        }
+
+        public static string BuildNamespaceConfigFromMigrationUnits(IEnumerable<MigrationUnit> migrationUnits)
+        {
+            var units = migrationUnits?.ToList() ?? new List<MigrationUnit>();
+            if (units.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            bool requiresJson = units.Any(mu =>
+                !string.Equals(mu.DatabaseName, mu.GetEffectiveTargetDatabaseName(), StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(mu.CollectionName, mu.GetEffectiveTargetCollectionName(), StringComparison.OrdinalIgnoreCase) ||
+                !string.IsNullOrWhiteSpace(mu.UserFilter) ||
+                mu.DataTypeFor_Id.HasValue);
+
+            if (!requiresJson)
+            {
+                return string.Join(",", units.Select(mu => $"{mu.DatabaseName}.{mu.CollectionName}"));
+            }
+
+            var collectionInfos = units.Select(mu => new CollectionInfo
+            {
+                DatabaseName = mu.DatabaseName,
+                CollectionName = mu.CollectionName,
+                TargetDatabaseName = string.Equals(mu.DatabaseName, mu.GetEffectiveTargetDatabaseName(), StringComparison.OrdinalIgnoreCase) ? null : mu.GetEffectiveTargetDatabaseName(),
+                TargetCollectionName = string.Equals(mu.CollectionName, mu.GetEffectiveTargetCollectionName(), StringComparison.OrdinalIgnoreCase) ? null : mu.GetEffectiveTargetCollectionName(),
+                Filter = string.IsNullOrWhiteSpace(mu.UserFilter) ? null : mu.UserFilter,
+                DataTypeFor_Id = mu.DataTypeFor_Id?.ToString()
+            }).ToList();
+
+            return JsonConvert.SerializeObject(collectionInfos, Formatting.Indented);
         }
         private static Tuple<bool, string, string> ValidateNamespaceFormatfromCSV(string input, bool split=true)
         {

@@ -1085,16 +1085,24 @@ namespace OnlineMongoMigrationProcessor.Workers
                 return;
 
             MongoClient? targetClient = MongoClientFactory.Create(_log, MigrationJobContext.TargetConnectionString[MigrationJobContext.CurrentlyActiveJob.Id]);
+            var targetDatabaseName = migrationUnit.GetEffectiveTargetDatabaseName();
+            var targetCollectionName = migrationUnit.GetEffectiveTargetCollectionName();
 
             bool checkExist;
             if (Helper.IsRU(MigrationJobContext.TargetConnectionString[MigrationJobContext.CurrentlyActiveJob.Id]))
-                checkExist = await MongoHelper.CheckRUCollectionExistsAsync(_sourceClient!, migrationUnit.DatabaseName, migrationUnit.CollectionName);
+                checkExist = await MongoHelper.CheckRUCollectionExistsAsync(targetClient!, targetDatabaseName, targetCollectionName);
             else
-                checkExist = await MongoHelper.CheckCollectionExistsAsync(_sourceClient!, migrationUnit.DatabaseName, migrationUnit.CollectionName);
+                checkExist = await MongoHelper.CheckCollectionExistsAsync(targetClient!, targetDatabaseName, targetCollectionName);
 
             if (checkExist && !MigrationJobContext.CurrentlyActiveJob.CSPostProcessingStarted)
             {
-                _log.WriteLine($"{migrationUnit.DatabaseName}.{migrationUnit.CollectionName} already exists on the target and is ready.", LogType.Debug);
+                var namespaceForLog = Log.FormatNamespaceForLog(
+                    migrationUnit.DatabaseName,
+                    migrationUnit.CollectionName,
+                    targetDatabaseName,
+                    targetCollectionName);
+
+                _log.WriteLine($"{namespaceForLog} already exists on the target and is ready.", LogType.Debug);
             }
         }
 

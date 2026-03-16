@@ -554,8 +554,10 @@ namespace OnlineMongoMigrationProcessor
 
         private (IMongoCollection<BsonDocument>? changeStreamCollection, IMongoCollection<BsonDocument>? targetCollection) GetCollectionsForChangeStream(MigrationUnit mu)
         {
-            string databaseName = mu.DatabaseName;
-            string collectionName = mu.CollectionName;
+            string sourceDatabaseName = mu.DatabaseName;
+            string sourceCollectionName = mu.CollectionName;
+            string targetDatabaseName = mu.GetEffectiveTargetDatabaseName();
+            string targetCollectionName = mu.GetEffectiveTargetCollectionName();
 
             IMongoDatabase targetDb;
             IMongoDatabase changeStreamDb;
@@ -564,22 +566,22 @@ namespace OnlineMongoMigrationProcessor
 
             if (!_syncBack)
             {
-                changeStreamDb = _changeStreamMongoClient.GetDatabase(databaseName);
-                changeStreamCollection = changeStreamDb.GetCollection<BsonDocument>(collectionName);
+                changeStreamDb = _changeStreamMongoClient.GetDatabase(sourceDatabaseName);
+                changeStreamCollection = changeStreamDb.GetCollection<BsonDocument>(sourceCollectionName);
 
                 if (!MigrationJobContext.CurrentlyActiveJob.IsSimulatedRun)
                 {
-                    targetDb = _targetClient.GetDatabase(databaseName);
-                    targetCollection = targetDb.GetCollection<BsonDocument>(collectionName);
+                    targetDb = _targetClient.GetDatabase(targetDatabaseName);
+                    targetCollection = targetDb.GetCollection<BsonDocument>(targetCollectionName);
                 }
             }
             else
             {
-                targetDb = _sourceClient.GetDatabase(databaseName);
-                targetCollection = targetDb.GetCollection<BsonDocument>(collectionName);
+                targetDb = _sourceClient.GetDatabase(sourceDatabaseName);
+                targetCollection = targetDb.GetCollection<BsonDocument>(sourceCollectionName);
                 
-                changeStreamDb = _changeStreamMongoClient.GetDatabase(databaseName);
-                changeStreamCollection = changeStreamDb.GetCollection<BsonDocument>(collectionName);
+                changeStreamDb = _changeStreamMongoClient.GetDatabase(targetDatabaseName);
+                changeStreamCollection = changeStreamDb.GetCollection<BsonDocument>(targetCollectionName);
             }
 
             return (changeStreamCollection, targetCollection);
@@ -654,13 +656,13 @@ namespace OnlineMongoMigrationProcessor
                 
                 if (targetCollection == null)
                 {
-                    var targetDb2 = _targetClient.GetDatabase(mu.DatabaseName);
-                    targetCollection = targetDb2.GetCollection<BsonDocument>(mu.CollectionName);
+                    var targetDb2 = _targetClient.GetDatabase(mu.GetEffectiveTargetDatabaseName());
+                    targetCollection = targetDb2.GetCollection<BsonDocument>(mu.GetEffectiveTargetCollectionName());
                 }
                 
                 var replaySourceClient = _syncBack ? _targetClient : _sourceClient;
-                var replaySourceDb = replaySourceClient.GetDatabase(mu.DatabaseName);
-                var replaySourceCollection = replaySourceDb.GetCollection<BsonDocument>(mu.CollectionName);
+                var replaySourceDb = replaySourceClient.GetDatabase(_syncBack ? mu.GetEffectiveTargetDatabaseName() : mu.DatabaseName);
+                var replaySourceCollection = replaySourceDb.GetCollection<BsonDocument>(_syncBack ? mu.GetEffectiveTargetCollectionName() : mu.CollectionName);
                 
                 // Use ResumeDocumentKey (full DocumentKey with shard key) instead of ResumeDocumentId
                 var documentKey = mu.ResumeDocumentKey ?? mu.ResumeDocumentId; // Fallback for backward compatibility

@@ -1,6 +1,8 @@
 ﻿@using OnlineMongoMigrationProcessor
 @using System.Collections.Generic;
 @using System.Text.Json;
+@using System.Collections.Generic;
+@using System.Text.Json;
 @using System.Text.RegularExpressions;
 
 <div class="modal fade show d-block bg-dark bg-opacity-75" id="myModal" aria-modal="true" role="dialog">
@@ -67,6 +69,22 @@
                         <select id="non-objectid-partitioner" value="@SelectedNonObjectIdPartitioner" class="form-select" @onchange="OnNonObjectIdPartitionerChanged">
                             <option value="UseSampleCommand" title="Use MongoDB's $sample command to generate chunk boundaries.">Use Sample Command</option>
                             <option value="UsePagination" title="Use pagination to create chunks of same size.">Use Pagination</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label for="split-large-partitions" class="form-label" title="When enabled, oversized chunks are split further during dump query planning.">
+                            <input type="checkbox" id="split-large-partitions" @bind="(_configurationBackup ??= new OnlineMongoMigrationProcessor.MigrationSettings()).LargePartitionsShouldBeSplit" />
+                            Split large partitions automatically
+                        </label>
+                    </div>
+                    <div class="mb-3">
+                        <label for="dump-restore-behavior" class="form-label" title="Controls whether to run both dump and restore, dump only, or restore only.">
+                            Mongo Dump Restore behavior
+                        </label>
+                        <select id="dump-restore-behavior" value="@SelectedMongoDumpRestoreBehavior" class="form-select" @onchange="OnMongoDumpRestoreBehaviorChanged">
+                            <option value="DumpAndRestore">Dump and Restore</option>
+                            <option value="DumpOnly">Dump Only</option>
+                            <option value="RestoreOnly">Restore Only</option>
                         </select>
                     </div>
                     <div class="mb-3">
@@ -144,6 +162,7 @@
 
     private string SelectedObjectIdPartitioner = "UseTimeBoundaries"; // Default partitioner
     private string SelectedNonObjectIdPartitioner = "UseSampleCommand"; // Default partitioner
+    private string SelectedMongoDumpRestoreBehavior = "DumpAndRestore"; // Default behavior
 
     private void SwitchToOfflineDataMovementTab()
     {
@@ -183,6 +202,17 @@
         }
     }
 
+    private void OnMongoDumpRestoreBehaviorChanged(ChangeEventArgs e)
+    {
+        var val = e?.Value?.ToString() ?? "DumpAndRestore";
+        SelectedMongoDumpRestoreBehavior = val;
+
+        if (Enum.TryParse<OnlineMongoMigrationProcessor.MongoDumpRestoreBehavior>(val, out var behavior))
+        {
+            (_configurationBackup ??= new OnlineMongoMigrationProcessor.MigrationSettings()).MongoDumpRestoreBehavior = behavior;
+        }
+    }
+
     private void ClearPem()
     {
         (_configurationBackup ??= new OnlineMongoMigrationProcessor.MigrationSettings()).CACertContentsForSourceServer = string.Empty;
@@ -205,6 +235,7 @@
         // Initialize the selected partitioner from the configuration
         SelectedObjectIdPartitioner = _configurationBackup.ObjectIdPartitioner.ToString();
         SelectedNonObjectIdPartitioner = _configurationBackup.NonObjectIdPartitioner.ToString();
+        SelectedMongoDumpRestoreBehavior = _configurationBackup.MongoDumpRestoreBehavior.ToString();
     }
 
 

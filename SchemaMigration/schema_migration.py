@@ -34,76 +34,39 @@ class SchemaMigration:
     UNSUPPORTED_PARTIAL_FILTER_LOGICAL_OPERATORS = {'$or', '$nor'}
 
     # Index options that are not supported on the destination (DocumentDB / Cosmos DB)
-    UNSUPPORTED_INDEX_OPTIONS = {'collation', 'hidden', 'clustered', 'prepareUnique', 'wildcardProjection'}
-    
-    # Invalid characters in collection names for DocumentDB
-    INVALID_COLLECTION_NAME_CHARS = ['/', '\\', '"', '$', '*', '<', '>', ':', '|', '?']
+    UNSUPPORTED_INDEX_OPTIONS = {'collation', 'hidden'}
 
     # Index option combinations that conflict
     CONFLICTING_INDEX_OPTION_PAIRS = [('sparse', 'partialFilterExpression')]
-    
-    # Default parallelization settings
-    DEFAULT_MAX_WORKERS = 32
 
-    def __init__(self, verbose: bool = False, max_workers: int = DEFAULT_MAX_WORKERS):
+    def __init__(self, verbose: bool = False):
         """
         Initialize the SchemaMigration class.
 
         :param verbose: Enable verbose output for detailed flow logging.
-        :param max_workers: Maximum number of parallel workers for collection processing.
         """
         self.verbose = verbose
-        self.max_workers = max_workers
         self.incompatible_indexes = []  # Track indexes with unsupported partialFilterExpression
         self.skipped_index_options = []  # Track indexes with unsupported options (collation, hidden, etc.)
         self.structural_incompatibilities = []  # Track structural issues (text dup, 2dsphere compound, etc.)
         self._state_lock = threading.Lock()
 
     def _print_verbose(self, message: str) -> None:
-        """Print a message if verbose mode is enabled (thread-safe)."""
+        """Print a message if verbose mode is enabled."""
         if self.verbose:
-            with self._print_lock:
-                print(message)
+            print(message)
 
     def _print_warning(self, message: str) -> None:
-        """Print a warning message in yellow (thread-safe)."""
-        with self._print_lock:
-            print_warning(message)
+        """Print a warning message in yellow."""
+        print_warning(message)
 
     def _print_error(self, message: str) -> None:
-        """Print an error message in red (thread-safe)."""
-        with self._print_lock:
-            print_error(message)
+        """Print an error message in red."""
+        print_error(message)
 
     def _print_success(self, message: str) -> None:
-        """Print a success/milestone message in green (thread-safe)."""
-        with self._print_lock:
-            print_success(message)
-    
-    def _print_info(self, message: str) -> None:
-        """Print an info message (thread-safe)."""
-        with self._print_lock:
-            print(message)
-    
-    def _append_incompatible_index(self, entry: Dict[str, Any]) -> None:
-        """Thread-safe append to incompatible_indexes list."""
-        with self._lock:
-            self.incompatible_indexes.append(entry)
-    
-    def _append_skipped_index_option(self, entry: Dict[str, Any]) -> None:
-        """Thread-safe append to skipped_index_options list."""
-        with self._lock:
-            self.skipped_index_options.append(entry)
-    
-    def _append_structural_incompatibility(self, entry: Dict[str, Any]) -> None:
-        """Thread-safe append to structural_incompatibilities list."""
-        with self._lock:
-            self.structural_incompatibilities.append(entry)
-    
-    def _append_failed_collection(self, entry: Dict[str, Any]) -> None:
-        """Thread-safe append to failed_collections list."""
-        with self._lock:
-            self.failed_collections.append(entry)
+        """Print a success/milestone message in green."""
+        print_success(message)
 
     def _validate_connections(
             self,
@@ -718,27 +681,6 @@ class SchemaMigration:
         self._print_warning("="*80)
         self._print_warning("Please review these indexes and manually adjust them for the destination.")
         self._print_warning("="*80 + "\n")
-
-    def _report_failed_collections(self) -> None:
-        """
-        Report all collections that failed during migration.
-        """
-        if not self.failed_collections:
-            return
-        
-        self._print_error("\n" + "="*80)
-        self._print_error("FAILED COLLECTIONS REPORT")
-        self._print_error("="*80)
-        self._print_error(f"\n{len(self.failed_collections)} collection(s) failed during migration:\n")
-        
-        for idx, entry in enumerate(self.failed_collections, 1):
-            self._print_error(f"{idx}. Collection: {entry['collection']}")
-            self._print_error(f"   Error: {entry['error']}")
-            print()
-        
-        self._print_error("="*80)
-        self._print_error("Please review and retry these collections manually.")
-        self._print_error("="*80 + "\n")
 
     def _is_compound_geospatial_index(self, index_keys: List[Tuple[str, Any]]) -> bool:
         """

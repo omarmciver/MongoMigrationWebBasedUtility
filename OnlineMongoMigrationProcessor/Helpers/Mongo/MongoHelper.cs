@@ -727,10 +727,22 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                 }
                 catch (Exception ex) when (ex is MongoExecutionTimeoutException || ex is TimeoutException)
                 {
-                    log.WriteLine($"{syncBackPrefix}Timeout when setting change stream resume token for {mu.DatabaseName}.{mu.CollectionName}: {ex}",LogType.Debug);
+                    var scope = useServerLevel
+                        ? "server-level"
+                        : $"{mu?.DatabaseName}.{mu?.CollectionName}";
 
-                    if (resetCS && string.IsNullOrEmpty(resumeToken))
+                    log.WriteLine($"{syncBackPrefix}Timeout when setting change stream resume token for {scope}: {ex}", LogType.Debug);
+
+                    // For normal setup (non-reset flow), do not loop indefinitely on repeated timeouts.
+                    // Server-level change stream processor can re-attempt later.
+                    if (!resetCS)
+                    {
                         skipLoops = true;
+                    }
+                    else if (string.IsNullOrEmpty(resumeToken))
+                    {
+                        skipLoops = true;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1203,7 +1215,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                 DataType.Decimal128 => filterBuilder.Lt(fieldName, value.AsDecimal128),
                 DataType.Date => filterBuilder.Lt(fieldName, ((BsonDateTime)value).ToUniversalTime()),
                 DataType.Object => filterBuilder.Lt(fieldName, value.AsBsonDocument),
-                DataType.BinData => filterBuilder.Lt(fieldName, value.AsBsonDocument),
+                DataType.BinData => filterBuilder.Lt(fieldName, value.AsBsonBinaryData),
                 _ => throw new ArgumentException($"Unsupported DataType: {dataType}")
             };
         }
@@ -1223,7 +1235,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                 DataType.Decimal128 => filterBuilder.Gte(fieldName, value.AsDecimal128),
                 DataType.Date => filterBuilder.Gte(fieldName, ((BsonDateTime)value).ToUniversalTime()),
                 DataType.Object => filterBuilder.Gte(fieldName, value.AsBsonDocument),
-                DataType.BinData => filterBuilder.Gte(fieldName, value.AsBsonDocument),
+                DataType.BinData => filterBuilder.Gte(fieldName, value.AsBsonBinaryData),
                 _ => throw new ArgumentException($"Unsupported DataType: {dataType}")
             };
         }
@@ -1444,7 +1456,7 @@ namespace OnlineMongoMigrationProcessor.Helpers.Mongo
                 DataType.Decimal128 => $"{{\\\"$numberDecimal\\\":\\\"{value.AsDecimal128}\\\"}}",
                 DataType.Date => $"{{\\\"$date\\\":\\\"{((BsonDateTime)value).ToUniversalTime():yyyy-MM-ddTHH:mm:ssZ}\\\"}}",
                 DataType.Object => value.AsBsonDocument.ToString(),
-                DataType.BinData => $"{{\\\"$binary\\\":{{\\\"base64\\\":\\\"{Convert.ToBase64String(value.AsBsonBinaryData.Bytes)}\\\",\\\"subType\\\":\\\"{value.AsBsonBinaryData.SubType:x2}\\\"}}}}",
+                DataType.BinData => $"{{\\\"$binary\\\":{{\\\"base64\\\":\\\"{Convert.ToBase64String(value.AsBsonBinaryData.Bytes)}\\\",\\\"subType\\\":\\\"{((byte)value.AsBsonBinaryData.SubType):x2}\\\"}}}}",
                 _ => throw new ArgumentException($"Unsupported DataType: {dataType}")
             };
         }

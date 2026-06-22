@@ -113,7 +113,23 @@ param(
     [string]$JFrogRegistryServerForACA = "",
 
     [Parameter(Mandatory=$false)]
-    [switch]$UpdateOnly
+    [switch]$UpdateOnly,
+
+    [Parameter(Mandatory=$false)]
+    [switch]$ReuseExistingEnvironment,
+
+    # Shared ACA environment name for multi-instance deployments.
+    # When deploying several container apps to the same environment, provide a common name
+    # (e.g., "mongo-migrator-env") so all instances share one environment and its workload profile.
+    # Leave empty to auto-generate from ContainerAppName (single-instance default behaviour).
+    [Parameter(Mandatory=$false)]
+    [string]$EnvironmentName = "",
+
+    # Maximum dedicated node count for the workload profile in the environment.
+    # Set this to the total number of container app instances sharing the environment.
+    [Parameter(Mandatory=$false)]
+    [ValidateRange(1, 100)]
+    [int]$WorkloadProfileMaxCount = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -347,7 +363,8 @@ if ($UpdateOnly) {
             "vCores=$VCores",
             "memoryGB=$MemoryGB",
             "ownerTag=$OwnerTag",
-            "useEntraIdForStorage=$($UseEntraIdForAzureStorage.ToString().ToLower())"
+            "useEntraIdForStorage=$($UseEntraIdForAzureStorage.ToString().ToLower())",
+            "reuseExistingEnvironment=$($ReuseExistingEnvironment.ToString().ToLower())"
     )
     
     # Add VNet configuration if provided
@@ -355,7 +372,12 @@ if ($UpdateOnly) {
         Write-Host "VNet integration enabled with subnet: $InfrastructureSubnetResourceId" -ForegroundColor Cyan
         $bicepParams += "infrastructureSubnetResourceId=$InfrastructureSubnetResourceId"
     }
-    
+    if (-not [string]::IsNullOrEmpty($EnvironmentName)) {
+        Write-Host "Using shared environment name: $EnvironmentName" -ForegroundColor Cyan
+        $bicepParams += "environmentName=$EnvironmentName"
+    }
+    $bicepParams += "workloadProfileMaxCount=$WorkloadProfileMaxCount"
+
     Write-Host "Running: az deployment group create..." -ForegroundColor Gray
     az @bicepParams
     
@@ -399,14 +421,19 @@ if ($UpdateOnly) {
             "aspNetCoreEnvironment=Development",
             "imageTag=$ImageTag",
             "ownerTag=$OwnerTag",
-            "useEntraIdForStorage=$($UseEntraIdForAzureStorage.ToString().ToLower())"
+                "useEntraIdForStorage=$($UseEntraIdForAzureStorage.ToString().ToLower())",
+                "reuseExistingEnvironment=$($ReuseExistingEnvironment.ToString().ToLower())"
     )
     
     # Add VNet configuration if provided
     if (-not [string]::IsNullOrEmpty($InfrastructureSubnetResourceId)) {
         $finalBicepParams += "infrastructureSubnetResourceId=$InfrastructureSubnetResourceId"
     }
-    
+    if (-not [string]::IsNullOrEmpty($EnvironmentName)) {
+        $finalBicepParams += "environmentName=$EnvironmentName"
+    }
+    $finalBicepParams += "workloadProfileMaxCount=$WorkloadProfileMaxCount"
+
     az @finalBicepParams
     
     if ($LASTEXITCODE -ne 0) {

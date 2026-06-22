@@ -52,9 +52,26 @@ param infrastructureSubnetResourceId string = ''
 @description('Use Entra ID (Managed Identity) for Azure Blob Storage instead of mounting Azure Files. When true, UseBlobServiceClient env var is set and no volume is mounted.')
 param useEntraIdForStorage bool = false
 
+@description('Name of the Container Apps Environment. When deploying multiple container apps to the same environment, provide a shared name so all instances reuse the same environment. Defaults to {containerAppName}-env-{workloadProfileType}.')
+param environmentName string = ''
+
+@description('Reuse an existing Container Apps Environment instead of creating one. Set this when environmentName points to an already deployed environment.')
+param reuseExistingEnvironment bool = false
+
+@description('Maximum number of dedicated workload profile nodes in the environment. Increase to match the number of container app instances sharing this environment.')
+@minValue(1)
+@maxValue(100)
+param workloadProfileMaxCount int = 1
+
 // Variables for dynamic workload profile selection
 var workloadProfileType = vCores <= 4 ? 'D4' : vCores <= 8 ? 'D8' : vCores <= 16 ? 'D16' : 'D32'
 var workloadProfileName = 'Dedicated'
+
+// Effective environment name: use provided shared name or derive from container app name
+var effectiveEnvironmentName = !empty(environmentName) ? environmentName : '${containerAppName}-env-${workloadProfileType}'
+
+// Unique storage configuration name per container app (avoids conflicts when sharing an environment)
+var storageConfigurationName = take(replace(containerAppName, '-', ''), 24)
 
 // Managed Identity for Container App (used for Azure Storage access, not registry)
 resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -96,8 +113,8 @@ resource fileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-0
 }
 
 // Container Apps Environment with Dedicated Plan
-resource containerAppEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' = {
-  name: '${containerAppName}-env-${workloadProfileType}'
+resource containerAppEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' = if (!reuseExistingEnvironment) {
+  name: effectiveEnvironmentName
   location: location
   tags: {
     owner: ownerTag
@@ -112,8 +129,8 @@ resource containerAppEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' 
         {
           name: workloadProfileName
           workloadProfileType: workloadProfileType
-          minimumCount: 1
-          maximumCount: 1
+          minimumCount: 0
+          maximumCount: workloadProfileMaxCount
         }
       ]
     },
@@ -126,10 +143,29 @@ resource containerAppEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' 
   )
 }
 
+// Existing environment reference used when reusing a pre-created environment
+resource existingContainerAppEnvironment 'Microsoft.App/managedEnvironments@2023-05-01' existing = if (reuseExistingEnvironment) {
+  name: effectiveEnvironmentName
+}
+
 // Storage configuration for Container Apps Environment (only when not using Entra ID)
-resource storageConfiguration 'Microsoft.App/managedEnvironments/storages@2023-05-01' = if (!useEntraIdForStorage) {
+// Name is derived from containerAppName to be unique per instance when sharing an environment
+resource storageConfiguration 'Microsoft.App/managedEnvironments/storages@2023-05-01' = if (!useEntraIdForStorage && !reuseExistingEnvironment) {
   parent: containerAppEnvironment
-  name: 'migration-storage'
+  name: storageConfigurationName
+  properties: {
+    azureFile: {
+      accountName: storageAccount.name
+      accountKey: storageAccount.listKeys().keys[0].value
+      shareName: 'migration-data'
+      accessMode: 'ReadWrite'
+    }
+  }
+}
+
+resource storageConfigurationExisting 'Microsoft.App/managedEnvironments/storages@2023-05-01' = if (!useEntraIdForStorage && reuseExistingEnvironment) {
+  parent: existingContainerAppEnvironment
+  name: storageConfigurationName
   properties: {
     azureFile: {
       accountName: storageAccount.name
@@ -165,7 +201,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
     }
   }
   properties: {
-    managedEnvironmentId: containerAppEnvironment.id
+    managedEnvironmentId: reuseExistingEnvironment ? existingContainerAppEnvironment.id : containerAppEnvironment.id
     workloadProfileName: workloadProfileName
     configuration: {
       secrets: concat(
@@ -304,7 +340,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
         {
           name: 'migration-data-volume'
           storageType: 'AzureFile'
-          storageName: 'migration-storage'
+          storageName: storageConfigurationName
         }
       ]
       scale: {
@@ -316,7 +352,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
   dependsOn: useEntraIdForStorage ? [
     storageBlobDataContributorRole
   ] : [
-    storageConfiguration
+    reuseExistingEnvironment ? storageConfigurationExisting : storageConfiguration
   ]
 }
 

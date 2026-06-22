@@ -76,6 +76,20 @@ param(
     
     [Parameter(Mandatory=$false)]
     [string]$StorageAccountName = "",
+
+    # Optional: Resource ID of an existing storage account to use instead of creating one.
+    # When provided, the storage account is referenced (not created). Useful for multi-instance
+    # deployments where all instances share one storage account (with existing private endpoint)
+    # while keeping data isolated via per-instance file shares.
+    # Mutually exclusive with auto-creation: when set, $StorageAccountName is ignored.
+    [Parameter(Mandatory=$false)]
+    [string]$StorageAccountResourceId = "",
+
+    # Optional: Name of the file share to mount inside the storage account.
+    # Defaults to 'migration-data' in Bicep. Override per-instance (e.g., 'migration-data-1',
+    # 'migration-data-2') when multiple container apps share a storage account.
+    [Parameter(Mandatory=$false)]
+    [string]$FileShareName = "",
     
     [Parameter(Mandatory=$false)]
     [string]$ImageName = "mongo-migration",
@@ -376,6 +390,15 @@ if ($UpdateOnly) {
         Write-Host "Using shared environment name: $EnvironmentName" -ForegroundColor Cyan
         $bicepParams += "environmentName=$EnvironmentName"
     }
+    # Shared (pre-configured) storage account + per-instance file share
+    if (-not [string]::IsNullOrEmpty($StorageAccountResourceId)) {
+        Write-Host "Using pre-configured storage account: $StorageAccountResourceId" -ForegroundColor Cyan
+        $bicepParams += "storageAccountResourceId=$StorageAccountResourceId"
+    }
+    if (-not [string]::IsNullOrEmpty($FileShareName)) {
+        Write-Host "Using file share name: $FileShareName" -ForegroundColor Cyan
+        $bicepParams += "fileShareName=$FileShareName"
+    }
     $bicepParams += "workloadProfileMaxCount=$WorkloadProfileMaxCount"
 
     Write-Host "Running: az deployment group create..." -ForegroundColor Gray
@@ -431,6 +454,13 @@ if ($UpdateOnly) {
     }
     if (-not [string]::IsNullOrEmpty($EnvironmentName)) {
         $finalBicepParams += "environmentName=$EnvironmentName"
+    }
+    # Shared (pre-configured) storage account + per-instance file share
+    if (-not [string]::IsNullOrEmpty($StorageAccountResourceId)) {
+        $finalBicepParams += "storageAccountResourceId=$StorageAccountResourceId"
+    }
+    if (-not [string]::IsNullOrEmpty($FileShareName)) {
+        $finalBicepParams += "fileShareName=$FileShareName"
     }
     $finalBicepParams += "workloadProfileMaxCount=$WorkloadProfileMaxCount"
 

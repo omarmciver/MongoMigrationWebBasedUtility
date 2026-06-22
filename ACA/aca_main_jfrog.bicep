@@ -23,8 +23,14 @@ param jfrogImageRepository string
 @description('Docker image tag to deploy')
 param imageTag string = 'latest'
 
-@description('Storage account name for persistent migration files')
+@description('Storage account name for persistent migration files. Ignored when storageAccountResourceId is provided.')
 param storageAccountName string = take('${replace(containerAppName, '-', '')}stor', 24)
+
+@description('Optional: Resource ID of an existing storage account to use instead of creating one. When provided, the storage account is referenced (not created) and must already have proper networking (e.g., private endpoint linked to the ACA environment\'s VNet). Must be in the same resource group as this deployment when using Azure Files mount mode. Default: empty (creates new account).')
+param storageAccountResourceId string = ''
+
+@description('Name of the file share to use for migration data. When sharing a storage account across multiple container apps, use unique share names per app (e.g., migration-data-1, migration-data-2). Default: migration-data.')
+param fileShareName string = 'migration-data'
 
 @secure()
 @description('StateStore connection string for the container')
@@ -70,8 +76,34 @@ var workloadProfileName = 'Dedicated'
 // Effective environment name: use provided shared name or derive from container app name
 var effectiveEnvironmentName = !empty(environmentName) ? environmentName : '${containerAppName}-env-${workloadProfileType}'
 
-// Unique storage configuration name per container app (avoids conflicts when sharing an environment)
-var storageConfigurationName = take(replace(containerAppName, '-', ''), 24)
+// Pre-configured storage account handling: when storageAccountResourceId is provided,
+// reference the existing account instead of creating a new one. This lets multiple container
+// apps share a single storage account (with existing private endpoint) and use per-instance
+// file shares for data isolation.
+var usePreConfiguredStorageAccount = !empty(storageAccountResourceId)
+var effectiveStorageAccountName = usePreConfiguredStorageAccount ? last(split(storageAccountResourceId, '/')) : storageAccountName
+var storageAccountSubscriptionId = usePreConfiguredStorageAccount ? split(storageAccountResourceId, '/')[2] : subscription().subscriptionId
+var storageAccountResourceGroupName = usePreConfiguredStorageAccount ? split(storageAccountResourceId, '/')[4] : resourceGroup().name
+
+// Storage configuration name on the managed environment.
+// IMPORTANT: ACA disallows changing accountName/shareName on an existing storage definition
+// (only the account key can be updated). When using a pre-configured storage account, derive
+// the storage config name from the file share name so each unique share gets its own fresh
+// storage definition. Any old/broken storage definitions tied to the prior name remain orphaned
+// in the environment (safe to delete manually after redeploy).
+// Single-storage-account mode falls back to the legacy container-app-derived name for
+// backward compatibility.
+var storageConfigurationName = usePreConfiguredStorageAccount
+  ? take(replace(fileShareName, '-', ''), 24)
+  : take(replace(containerAppName, '-', ''), 24)
+
+// Resolve the storage account key via listKeys() function form so it works whether the account
+// is created here or already exists. ARM control-plane listKeys works regardless of storage
+// account network policy (private endpoint, firewall rules, etc.).
+var storageAccountKey = listKeys(
+  resourceId(storageAccountSubscriptionId, storageAccountResourceGroupName, 'Microsoft.Storage/storageAccounts', effectiveStorageAccountName),
+  '2023-01-01'
+).keys[0].value
 
 // Managed Identity for Container App (used for Azure Storage access, not registry)
 resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -83,8 +115,9 @@ resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-
 }
 
 // Storage Account for persistent migration files
-resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
-  name: storageAccountName
+// Only created when storageAccountResourceId is NOT provided
+resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = if (!usePreConfiguredStorageAccount) {
+  name: effectiveStorageAccountName
   location: location
   kind: 'StorageV2'
   sku: {
@@ -103,13 +136,18 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   }
 }
 
-// File Share for migration data (100GB) - only needed when NOT using Entra ID
+// File Share for migration data - only needed when NOT using Entra ID
+// Idempotent: creates the share if missing on either a new or pre-configured account
+// (works in same RG; cross-RG storage requires deploying file share separately)
 resource fileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-01-01' = if (!useEntraIdForStorage) {
-  name: '${storageAccount.name}/default/migration-data'
+  name: '${effectiveStorageAccountName}/default/${fileShareName}'
   properties: {
     shareQuota: 100
     enabledProtocols: 'SMB'
   }
+  dependsOn: usePreConfiguredStorageAccount ? [] : [
+    storageAccount
+  ]
 }
 
 // Container Apps Environment with Dedicated Plan
@@ -149,18 +187,23 @@ resource existingContainerAppEnvironment 'Microsoft.App/managedEnvironments@2023
 }
 
 // Storage configuration for Container Apps Environment (only when not using Entra ID)
-// Name is derived from containerAppName to be unique per instance when sharing an environment
+// Name is derived from containerAppName to be unique per instance when sharing an environment.
+// Uses effectiveStorageAccountName + listKeys() function form so it works for both
+// newly created and pre-configured storage accounts.
 resource storageConfiguration 'Microsoft.App/managedEnvironments/storages@2023-05-01' = if (!useEntraIdForStorage && !reuseExistingEnvironment) {
   parent: containerAppEnvironment
   name: storageConfigurationName
   properties: {
     azureFile: {
-      accountName: storageAccount.name
-      accountKey: storageAccount.listKeys().keys[0].value
-      shareName: 'migration-data'
+      accountName: effectiveStorageAccountName
+      accountKey: storageAccountKey
+      shareName: fileShareName
       accessMode: 'ReadWrite'
     }
   }
+  dependsOn: [
+    fileShare
+  ]
 }
 
 resource storageConfigurationExisting 'Microsoft.App/managedEnvironments/storages@2023-05-01' = if (!useEntraIdForStorage && reuseExistingEnvironment) {
@@ -168,16 +211,21 @@ resource storageConfigurationExisting 'Microsoft.App/managedEnvironments/storage
   name: storageConfigurationName
   properties: {
     azureFile: {
-      accountName: storageAccount.name
-      accountKey: storageAccount.listKeys().keys[0].value
-      shareName: 'migration-data'
+      accountName: effectiveStorageAccountName
+      accountKey: storageAccountKey
+      shareName: fileShareName
       accessMode: 'ReadWrite'
     }
   }
+  dependsOn: [
+    fileShare
+  ]
 }
 
 // Role assignment for Managed Identity to access Blob Storage (only when using Entra ID)
-resource storageBlobDataContributorRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (useEntraIdForStorage) {
+// Only deployed for newly created storage accounts. For pre-configured storage accounts,
+// the role assignment must be created separately (cross-RG role assignment requires a module).
+resource storageBlobDataContributorRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (useEntraIdForStorage && !usePreConfiguredStorageAccount) {
   name: guid(storageAccount.id, managedIdentity.id, 'storageBlobDataContributor')
   scope: storageAccount
   properties: {
@@ -282,7 +330,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             }
             {
               name: 'BlobServiceClientURI'
-              value: 'https://${storageAccount.name}.blob.${environment().suffixes.storage}'
+              value: 'https://${effectiveStorageAccountName}.blob.${environment().suffixes.storage}'
             }
             {
               name: 'BlobContainerName'
@@ -373,10 +421,10 @@ output managedIdentityId string = managedIdentity.id
 output managedIdentityClientId string = managedIdentity.properties.clientId
 
 @description('Storage Account Name for migration data')
-output storageAccountName string = storageAccount.name
+output storageAccountName string = effectiveStorageAccountName
 
 @description('File Share Name for migration data (only when not using Entra ID)')
-output fileShareName string = 'migration-data'
+output fileShareName string = fileShareName
 
 @description('Resource Drive Mount Path in container')
 output resourceDrivePath string = '/app/migration-data'
@@ -385,7 +433,7 @@ output resourceDrivePath string = '/app/migration-data'
 output storageMode string = useEntraIdForStorage ? 'EntraIdBlobStorage' : 'MountedAzureFiles'
 
 @description('Blob Service URI (only when using Entra ID)')
-output blobServiceUri string = useEntraIdForStorage ? 'https://${storageAccount.name}.blob.${environment().suffixes.storage}' : ''
+output blobServiceUri string = useEntraIdForStorage ? 'https://${effectiveStorageAccountName}.blob.${environment().suffixes.storage}' : ''
 
 @description('JFrog Registry Server')
 output jfrogRegistry string = jfrogRegistryServer

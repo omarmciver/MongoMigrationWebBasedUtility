@@ -117,25 +117,27 @@ if (Test-Path "ACA/aca_main.bicep") {
             --only-show-errors 2>&1
         
         if ($LASTEXITCODE -eq 0) {
-            Write-Host "✓ Bicep template validation passed" -ForegroundColor Green
+        Write-Host 'OK: Bicep template validation passed' -ForegroundColor Green
         } else {
-            Write-Host "✗ Bicep template validation failed:" -ForegroundColor Red
+            Write-Host 'FAIL: Bicep template validation failed:' -ForegroundColor Red
             Write-Host $validation -ForegroundColor Red
         }
     } catch {
-        Write-Host "✗ Error validating template: $_" -ForegroundColor Red
+        Write-Host ('FAIL: Error validating template: {0}' -f $_) -ForegroundColor Red
     }
 } else {
-    Write-Host "✗ ACA/aca_main.bicep not found" -ForegroundColor Red
+    Write-Host 'FAIL: ACA/aca_main.bicep not found' -ForegroundColor Red
 }
 
-Write-Host "`n=== Troubleshooting Summary ===" -ForegroundColor Cyan
-Write-Host "If deployment still fails, try:" -ForegroundColor Yellow
-Write-Host "1. Use a different region from the supported list" -ForegroundColor White
-Write-Host "2. Use a unique ACR name with random numbers" -ForegroundColor White
-Write-Host "3. Check that your subscription has sufficient quota" -ForegroundColor White
-Write-Host "4. Try deployment without Application Gateway first" -ForegroundColor White
-Write-Host "5. Contact Azure support if region-specific issues persist" -ForegroundColor White
+Write-Host ''
+Write-Host '=== Troubleshooting Summary ===' -ForegroundColor Cyan
+Write-Host 'If deployment still fails, try:' -ForegroundColor Yellow
+Write-Host '1. Use a different region from the supported list' -ForegroundColor White
+Write-Host '2. Use a unique ACR name with random numbers' -ForegroundColor White
+Write-Host '3. Check that your subscription has sufficient quota' -ForegroundColor White
+Write-Host '4. Try deployment without Application Gateway first' -ForegroundColor White
+Write-Host '5. Contact Azure support if region-specific issues persist' -ForegroundColor White
 
-Write-Host "`nSuggested deployment command:" -ForegroundColor Cyan
-Write-Host "./deploy-to-aca.ps1 -ResourceGroupName '$ResourceGroupName' -Location '$Location' -AcrName '$AcrName'" -ForegroundColor Green
+Write-Host ''
+Write-Host 'Suggested deployment command:' -ForegroundColor Cyan
+Write-Host ('./deploy-to-aca.ps1 -ResourceGroupName ''{0}'' -Location ''{1}'' -AcrName ''{2}''' -f $ResourceGroupName, $Location, $AcrName) -ForegroundColor Green

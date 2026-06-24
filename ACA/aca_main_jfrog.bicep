@@ -10,6 +10,9 @@ param containerAppName string
 @description('JFrog Registry server URL (e.g., yourcompany.jfrog.io)')
 param jfrogRegistryServer string
 
+@description('Optional JFrog Registry server URL used by Azure Container Apps for image pulls. Defaults to jfrogRegistryServer. Useful when ACA must pull from a registry endpoint with a port suffix.')
+param jfrogRegistryServerForACA string = ''
+
 @description('JFrog Registry username')
 param jfrogUsername string
 
@@ -69,9 +72,16 @@ param reuseExistingEnvironment bool = false
 @maxValue(100)
 param workloadProfileMaxCount int = 1
 
+@description('Seconds the container runtime waits after SIGTERM before force-killing the container. ACA platform cap is 600.')
+@minValue(0)
+@maxValue(600)
+param terminationGracePeriodSeconds int = 600
+
 // Variables for dynamic workload profile selection
 var workloadProfileType = vCores <= 4 ? 'D4' : vCores <= 8 ? 'D8' : vCores <= 16 ? 'D16' : 'D32'
 var workloadProfileName = 'Dedicated'
+var effectiveJfrogRegistryServer = !empty(jfrogRegistryServerForACA) ? jfrogRegistryServerForACA : jfrogRegistryServer
+var effectiveJfrogImageRepository = startsWith(jfrogImageRepository, '${effectiveJfrogRegistryServer}/') ? jfrogImageRepository : '${effectiveJfrogRegistryServer}/${jfrogImageRepository}'
 
 // Effective environment name: use provided shared name or derive from container app name
 var effectiveEnvironmentName = !empty(environmentName) ? environmentName : '${containerAppName}-env-${workloadProfileType}'
@@ -269,7 +279,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       // JFrog Registry configuration with username/password authentication
       registries: [
         {
-          server: jfrogRegistryServer
+          server: effectiveJfrogRegistryServer
           username: jfrogUsername
           passwordSecretRef: 'jfrog-password'
         }
@@ -290,7 +300,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
       containers: [
         {
           name: containerAppName
-          image: stateStoreAppID == '' ? 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest' : '${jfrogImageRepository}:${imageTag}'
+          image: stateStoreAppID == '' ? 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest' : '${effectiveJfrogImageRepository}:${imageTag}'
           resources: {
             cpu: vCores
             memory: '${memoryGB}Gi'
@@ -395,6 +405,7 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
         minReplicas: 1
         maxReplicas: 1
       }
+      terminationGracePeriodSeconds: terminationGracePeriodSeconds
     }
   }
   dependsOn: useEntraIdForStorage ? [

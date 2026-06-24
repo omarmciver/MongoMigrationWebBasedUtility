@@ -34,6 +34,64 @@
 # See the TODO comment in Dockerfile.jfrog for the exact change needed.
 # =============================================================================
 
+# =============================================================================
+# DEPLOY MODEL: TWO-PASS ARM DEPLOYMENT (per instance invocation)
+# =============================================================================
+# This script performs TWO separate ARM deployments per call (unless -UpdateOnly):
+#
+#   Pass 1 (Step 2) -- Infrastructure setup:
+#     az deployment group create ... aca_main_jfrog.bicep
+#     Deploys: storage account/link, managed identity, ACA environment (or reuses),
+#     workload profile. Does NOT pass stateStoreConnectionString or imageTag yet.
+#
+#   Pass 2 (Step 4) -- Container App with image + statestore:
+#     az deployment group create ... aca_main_jfrog.bicep
+#     Deploys: same Bicep, now with stateStoreAppID, stateStoreConnectionString,
+#     imageTag, aspNetCoreEnvironment. ARM is idempotent -- both passes target the
+#     same containerAppName, so Pass 2 updates what Pass 1 created.
+#
+# If $StateStoreConnectionString is empty, Pass 2 blocks on Read-Host. Always
+# supply -StateStoreConnectionString to avoid interactive prompts in the TUI.
+#
+# -UpdateOnly skips both ARM passes and calls 'az containerapp update --image'
+# instead (fast revision swap, no infra changes).
+# =============================================================================
+
+# ============================================================
+# TUI SINGLE-INSTANCE USAGE
+# ============================================================
+# The ACA TUI (manage-aca.ps1) calls this script once per new instance.
+# Image is already built and pushed (first instance builds it; TUI reuses the tag).
+#
+# New instance (full two-pass ARM deploy):
+#   & .\deploy-to-aca-jfrog.ps1 `
+#     -ResourceGroupName        $AcaConfig.ResourceGroupName `
+#     -ContainerAppName         "mongo-migrator-N" `
+#     -EnvironmentName          $AcaConfig.EnvironmentName `
+#     -ReuseExistingEnvironment $true `
+#     -JFrogRegistryServer      $AcaConfig.JFrogRegistryServer `
+#     -JFrogRegistryServerForACA $AcaConfig.JFrogRegistryServerForACA `
+#     -JFrogUsername            $AcaConfig.JFrogUsername `
+#     -JFrogPassword            $AcaConfig.JFrogPassword `
+#     -JFrogRepository          $AcaConfig.JFrogRepository `
+#     -JFrogDebianRepo          $AcaConfig.JFrogDebianRepo `
+#     -JFrogDebianComponent     $AcaConfig.JFrogDebianComponent `
+#     -JFrogNuGetRepo           $AcaConfig.JFrogNuGetRepo `
+#     -Location                 $AcaConfig.Location `
+#     -OwnerTag                 $AcaConfig.OwnerTag `
+#     -InfrastructureSubnetResourceId $AcaConfig.InfrastructureSubnetResourceId `
+#     -StateStoreConnectionString $AcaConfig.StateStoreConnectionString `
+#     -StorageAccountResourceId $AcaConfig.SharedStorageAccountResourceId `
+#     -FileShareName            "migration-data-N" `
+#     -ImageTag                 $SelectedTag `
+#     -SkipDockerBuild `
+#     -TerminationGracePeriodSeconds 600 `
+#     -WorkloadProfileMaxCount  $TotalInstanceCount
+#
+# Image update only (existing instance -- fast path):
+#   Add -UpdateOnly to the above (skips both ARM passes, swaps revision image only)
+# ============================================================
+
 param(
     [Parameter(Mandatory=$true)]
     [string]$ResourceGroupName,
@@ -143,7 +201,13 @@ param(
     # Set this to the total number of container app instances sharing the environment.
     [Parameter(Mandatory=$false)]
     [ValidateRange(1, 100)]
-    [int]$WorkloadProfileMaxCount = 1
+    [int]$WorkloadProfileMaxCount = 1,
+
+    # Seconds the container runtime waits after SIGTERM before force-killing.
+    # ACA platform cap is 600 (validated on Dedicated D8, API 2023-05-01).
+    [Parameter(Mandatory=$false)]
+    [ValidateRange(0, 600)]
+    [int]$TerminationGracePeriodSeconds = 600
 )
 
 $ErrorActionPreference = "Stop"
@@ -400,6 +464,7 @@ if ($UpdateOnly) {
         $bicepParams += "fileShareName=$FileShareName"
     }
     $bicepParams += "workloadProfileMaxCount=$WorkloadProfileMaxCount"
+    $bicepParams += "terminationGracePeriodSeconds=$TerminationGracePeriodSeconds"
 
     Write-Host "Running: az deployment group create..." -ForegroundColor Gray
     az @bicepParams
@@ -463,6 +528,7 @@ if ($UpdateOnly) {
         $finalBicepParams += "fileShareName=$FileShareName"
     }
     $finalBicepParams += "workloadProfileMaxCount=$WorkloadProfileMaxCount"
+    $finalBicepParams += "terminationGracePeriodSeconds=$TerminationGracePeriodSeconds"
 
     az @finalBicepParams
     

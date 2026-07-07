@@ -72,6 +72,17 @@ namespace OnlineMongoMigrationProcessor
             set => _indexBuildComplete = value;
         }
         private bool _indexBuildComplete;
+
+        /// <summary>
+        /// Backing-field-only view of <see cref="IndexBuildComplete"/>. The public getter
+        /// reports true whenever <see cref="IndexesExpected"/> == 0 alongside dump/restore
+        /// completion, which is misleading during the post-copy window before the non-unique
+        /// pre-count has run. Callers that need to know whether the index-build phase has
+        /// actually finished (vs. simply not started) should read this property instead.
+        /// </summary>
+        [JsonIgnore]
+        [BsonIgnore]
+        public bool IndexBuildCompleteExplicit => _indexBuildComplete;
         /// <summary>
         /// Count of non-unique indexes that have been created on the target collection.
         /// </summary>
@@ -288,6 +299,11 @@ namespace OnlineMongoMigrationProcessor
         public long SourceCountDuringCopy { get; set; }
         public long DumpGap { get; set; }
         public long RestoreGap { get; set; }
+
+        // Populated from collStats.avgObjSize at partition prep. 0 = unknown.
+        // Used by ProcessExecutor to convert mongorestore's byte-progress output
+        // into an approximate restored doc count so % completion updates mid-restore.
+        public long AvgDocSizeBytes { get; set; }
 
         public long CSDInsertEvents { get; set; }
         public long CSDeleteEvents { get; set; }
